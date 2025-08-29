@@ -3,7 +3,7 @@
 use std::{env, io, path::PathBuf};
 
 use oci_spec::image::Platform;
-use ocidir::{cap_std::fs::Dir, BlobWriter, OciDir, WriteComplete};
+use ocidir::{BlobWriter, OciDir, WriteComplete, cap_std::fs::Dir};
 
 struct NoCompression<'a>(BlobWriter<'a>);
 

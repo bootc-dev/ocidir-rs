@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{prelude::*, BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, prelude::*};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -287,7 +287,7 @@ impl OciDir {
     }
 
     /// Create a blob (can be anything).
-    pub fn create_blob(&self) -> Result<BlobWriter> {
+    pub fn create_blob(&self) -> Result<BlobWriter<'_>> {
         BlobWriter::new(&self.dir)
     }
 
@@ -314,9 +314,9 @@ impl OciDir {
 
     /// Create a tar output stream, backed by a blob
     pub fn create_layer(
-        &self,
+        &'_ self,
         c: Option<flate2::Compression>,
-    ) -> Result<tar::Builder<LayerWriter<GzEncoder<BlobWriter>>>> {
+    ) -> Result<tar::Builder<LayerWriter<'_, GzEncoder<BlobWriter<'_>>>>> {
         Ok(tar::Builder::new(self.create_gzip_layer(c)?))
     }
 
@@ -429,7 +429,12 @@ impl OciDir {
         } else {
             oci_image::HistoryBuilder::default().build().unwrap()
         };
-        config.history_mut().push(history);
+        match config.history_mut() {
+            Some(h) => h.push(history),
+            None => {
+                config.set_history(Some(vec![history]));
+            }
+        }
     }
 
     /// Add a layer to the top of the image stack with desired history entry.
@@ -642,7 +647,7 @@ impl OciDir {
             media_type => {
                 return Err(Error::UnexpectedMediaType {
                     media_type: media_type.clone(),
-                })
+                });
             }
         }
         validated.insert(config_digest.into());
@@ -915,13 +920,14 @@ mod tests {
         assert!(w.has_blob(&root_layer_desc).unwrap());
 
         // Check that we don't find nonexistent blobs
-        assert!(!w
-            .has_blob(&Descriptor::new(
+        assert!(
+            !w.has_blob(&Descriptor::new(
                 MediaType::ImageLayerGzip,
                 root_layer.blob.size,
                 root_layer.uncompressed_sha256.clone()
             ))
-            .unwrap());
+            .unwrap()
+        );
 
         let mut manifest = w.new_empty_manifest()?.build()?;
         let mut config = oci_image::ImageConfigurationBuilder::default()
@@ -930,7 +936,7 @@ mod tests {
         let annotations: Option<HashMap<String, String>> = None;
         w.push_layer(&mut manifest, &mut config, root_layer, "root", annotations);
         {
-            let history = config.history().first().unwrap();
+            let history = config.history().as_ref().unwrap().first().unwrap();
             assert_eq!(history.created_by().as_ref().unwrap(), "root");
             let created = history.created().as_deref().unwrap();
             let ts = chrono::DateTime::parse_from_rfc3339(created)
@@ -1077,7 +1083,7 @@ mod tests {
             .unwrap();
         w.push_layer_with_history(&mut manifest, &mut config, root_layer, Some(history));
         {
-            let history = config.history().first().unwrap();
+            let history = config.history().as_ref().unwrap().first().unwrap();
             assert_eq!(history.created_by().as_deref().unwrap(), "/bin/pretend-tar");
             assert_eq!(history.created().as_ref(), None);
         }
