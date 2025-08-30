@@ -429,12 +429,7 @@ impl OciDir {
         } else {
             oci_image::HistoryBuilder::default().build().unwrap()
         };
-        match config.history_mut() {
-            Some(h) => h.push(history),
-            None => {
-                config.set_history(Some(vec![history]));
-            }
-        }
+        config.history_mut().get_or_insert_default().push(history);
     }
 
     /// Add a layer to the top of the image stack with desired history entry.
