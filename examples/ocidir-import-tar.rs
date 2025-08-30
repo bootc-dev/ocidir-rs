@@ -42,7 +42,12 @@ fn import(oci_dir: &OciDir, name: &str, src: File) -> anyhow::Result<()> {
         .created_by(name.to_string())
         .build()
         .unwrap();
-    config.history_mut().push(h);
+    match config.history_mut() {
+        Some(v) => v.push(h),
+        None => {
+            config.set_history(Some(vec![h]));
+        }
+    }
 
     println!(
         "Created image with manifest: {}",

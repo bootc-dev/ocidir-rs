@@ -1,8 +1,8 @@
 [package]
 name = "ocidir"
 description = "A Rust library for reading and writing OCI (opencontainers) layout directories"
-version = "0.5.0"
-edition = "2021"
+version = "0.6.0"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/containers/ocidir-rs"
 keywords = ["oci", "opencontainers", "docker", "podman", "containers"]
