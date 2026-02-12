@@ -10,7 +10,7 @@ keywords = ["oci", "opencontainers", "docker", "podman", "containers"]
 [dependencies]
 camino = "1.0.4"
 chrono = "0.4.19"
-cap-std-ext = "4.0"
+cap-std-ext = "5.0"
 flate2 = { features = ["zlib"], default-features = false, version = "1.0.20" }
 hex = "0.4.3"
 openssl = "0.10.33"
@@ -25,7 +25,7 @@ canon-json = "0.2.0"
 
 [dev-dependencies]
 anyhow = "1.0.89"
-cap-tempfile = "3.3.0"
+cap-tempfile = "4.0"
 
 [features]
 zstd = ["dep:zstd"]
