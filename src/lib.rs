@@ -8,7 +8,7 @@ use cap_std_ext::dirext::CapStdExtDirExt;
 use flate2::write::GzEncoder;
 use oci_image::MediaType;
 use oci_spec::image::{
-    self as oci_image, Descriptor, Digest, ImageConfiguration, ImageIndex, ImageManifest,
+    self as oci_image, Descriptor, Digest, ImageConfiguration, ImageIndex, ImageManifest, Platform,
     Sha256Digest,
 };
 use openssl::hash::{Hasher, MessageDigest};
@@ -72,12 +72,34 @@ pub enum Error {
     #[error("Cannot find the Image Index (index.json)")]
     /// Returned when the OCI Image Index (index.json) is missing
     MissingImageIndex,
+    #[error("Image index contains no manifests")]
+    /// Returned when the image index is empty
+    EmptyImageIndex,
+    #[error("Tag '{tag}' not found in image index")]
+    /// Returned when a requested tag is not found
+    TagNotFound {
+        /// The tag that was not found
+        tag: Box<str>,
+    },
+    #[error("No manifest found for platform {os}/{architecture}; available: {available}")]
+    /// Returned when no manifest matches the requested platform
+    NoMatchingPlatform {
+        /// The requested OS
+        os: Box<str>,
+        /// The requested architecture
+        architecture: Box<str>,
+        /// Available platforms as a comma-separated list
+        available: Box<str>,
+    },
     #[error("Unexpected media type {media_type}")]
     /// Returned when there's an unexpected media type
     UnexpectedMediaType {
         /// The unexpected media type that was encountered
         media_type: MediaType,
     },
+    #[error("Nested image indices are not supported")]
+    /// Returned when a nested image index is encountered
+    NestedImageIndex,
     #[error("error")]
     /// An unknown other error
     Other(Box<str>),
@@ -129,6 +151,20 @@ impl Blob {
     pub fn size(&self) -> u64 {
         self.size
     }
+}
+
+/// Result of resolving a manifest for a specific platform.
+///
+/// Contains the resolved manifest along with its descriptor, and optionally
+/// the image index (manifest list) it was resolved from with its descriptor.
+#[derive(Debug)]
+pub struct ResolvedManifest {
+    /// The resolved image manifest
+    pub manifest: ImageManifest,
+    /// The descriptor of the manifest (includes digest, size, media type)
+    pub manifest_descriptor: Descriptor,
+    /// The image index this manifest was resolved from, if any (with its descriptor)
+    pub source_index: Option<(ImageIndex, Descriptor)>,
 }
 
 /// Completed layer metadata
@@ -546,6 +582,12 @@ impl OciDir {
             }
         };
 
+        self.write_index(&index)?;
+        Ok(manifest)
+    }
+
+    /// Write an `ImageIndex` to `index.json` using canonical JSON formatting.
+    fn write_index(&self, index: &oci_image::ImageIndex) -> Result<()> {
         self.dir
             .atomic_replace_with("index.json", |mut w| -> Result<()> {
                 let mut ser =
@@ -553,7 +595,7 @@ impl OciDir {
                 index.serialize(&mut ser)?;
                 Ok(())
             })?;
-        Ok(manifest)
+        Ok(())
     }
 
     /// Convenience helper to write the provided config, update the manifest to use it, then call [`insert_manifest`].
@@ -586,14 +628,7 @@ impl OciDir {
             .manifests(vec![manifest])
             .build()
             .unwrap();
-        self.dir
-            .atomic_replace_with("index.json", |mut w| -> Result<()> {
-                let mut ser =
-                    serde_json::Serializer::with_formatter(&mut w, CanonicalFormatter::new());
-                index_data.serialize(&mut ser)?;
-                Ok(())
-            })?;
-        Ok(())
+        self.write_index(&index_data)
     }
 
     fn descriptor_is_tagged(d: &Descriptor, tag: &str) -> bool {
@@ -621,6 +656,176 @@ impl OciDir {
             .iter()
             .find(|desc| Self::descriptor_is_tagged(desc, tag))
             .cloned())
+    }
+
+    /// Open an image manifest for the current platform.
+    ///
+    /// This resolves the appropriate manifest from the index for the native
+    /// platform (OS and architecture). If `tag` is provided, only manifests
+    /// with that tag annotation are considered.
+    ///
+    /// If the index contains an image index (manifest list), it is "peeled"
+    /// to get the underlying manifests. Nested image indices are not supported.
+    ///
+    /// Returns a [`ResolvedManifest`] containing the manifest, its digest,
+    /// and optionally the image index it was resolved from with its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The index cannot be read
+    /// - The index is empty
+    /// - A tag is specified but not found
+    /// - No manifest matches the native platform
+    /// - A nested image index is encountered
+    pub fn open_image_this_platform(&self, tag: Option<&str>) -> Result<ResolvedManifest> {
+        let index = self.read_index()?;
+        let manifests = index.manifests();
+
+        // Filter by tag if specified, returning early on empty results
+        let candidates: Vec<_> = if let Some(tag) = tag {
+            let tagged: Vec<_> = manifests
+                .iter()
+                .filter(|d| Self::descriptor_is_tagged(d, tag))
+                .collect();
+            if tagged.is_empty() {
+                return Err(Error::TagNotFound { tag: tag.into() });
+            }
+            tagged
+        } else {
+            if manifests.is_empty() {
+                return Err(Error::EmptyImageIndex);
+            }
+            manifests.iter().collect()
+        };
+
+        // Get the native platform
+        let native_platform = Platform::default();
+
+        // Collect all found candidate descriptors for error reporting
+        let mut found_candidates: Vec<Descriptor> = Vec::new();
+
+        for desc in candidates {
+            match desc.media_type() {
+                MediaType::ImageManifest => {
+                    // Direct manifest in the top-level index
+                    if let Some(platform) = desc.platform().as_ref()
+                        && Self::platform_compatible(platform, &native_platform)
+                    {
+                        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
+                        return Ok(ResolvedManifest {
+                            manifest,
+                            manifest_descriptor: desc.clone(),
+                            source_index: None,
+                        });
+                    }
+                    found_candidates.push(desc.clone());
+                }
+                MediaType::ImageIndex => {
+                    // Peel the manifest list
+                    let nested: ImageIndex = self.read_json_blob(desc)?;
+                    let index_descriptor = desc.clone();
+
+                    if let Some(resolved) = self.resolve_manifest_list(
+                        nested,
+                        index_descriptor,
+                        &native_platform,
+                        &mut found_candidates,
+                    )? {
+                        return Ok(resolved);
+                    }
+                }
+                other => {
+                    return Err(Error::UnexpectedMediaType {
+                        media_type: other.clone(),
+                    });
+                }
+            }
+        }
+
+        // No match found
+        Err(Error::NoMatchingPlatform {
+            os: native_platform.os().to_string().into(),
+            architecture: native_platform.architecture().to_string().into(),
+            available: Self::format_available_platforms(found_candidates.iter()),
+        })
+    }
+
+    /// Resolve a manifest from an image index (manifest list) for a given platform.
+    ///
+    /// Iterates the manifests within the index, returning the first one that
+    /// matches `native_platform`. Non-matching descriptors are appended to
+    /// `found_candidates` so callers can include them in error messages.
+    ///
+    /// Returns `Ok(None)` if no manifest in this index matched.
+    fn resolve_manifest_list(
+        &self,
+        index: ImageIndex,
+        index_descriptor: Descriptor,
+        native_platform: &Platform,
+        found_candidates: &mut Vec<Descriptor>,
+    ) -> Result<Option<ResolvedManifest>> {
+        for desc in index.manifests() {
+            match desc.media_type() {
+                MediaType::ImageIndex => {
+                    return Err(Error::NestedImageIndex);
+                }
+                MediaType::ImageManifest => {
+                    if let Some(platform) = desc.platform().as_ref()
+                        && Self::platform_compatible(platform, native_platform)
+                    {
+                        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
+                        return Ok(Some(ResolvedManifest {
+                            manifest,
+                            manifest_descriptor: desc.clone(),
+                            source_index: Some((index, index_descriptor)),
+                        }));
+                    }
+                    found_candidates.push(desc.clone());
+                }
+                other => {
+                    return Err(Error::UnexpectedMediaType {
+                        media_type: other.clone(),
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Format the available platforms from a list of descriptors for error messages.
+    /// Limits output to 10 platforms to prevent excessive memory usage.
+    fn format_available_platforms<'a>(manifests: impl Iterator<Item = &'a Descriptor>) -> Box<str> {
+        const MAX_PLATFORMS_IN_ERROR: usize = 10;
+
+        let platforms: Vec<_> = manifests
+            .filter_map(|d| {
+                d.platform()
+                    .as_ref()
+                    .map(|p| format!("{}/{}", p.os(), p.architecture()))
+            })
+            .take(MAX_PLATFORMS_IN_ERROR + 1) // Take one extra to detect truncation
+            .collect();
+
+        if platforms.is_empty() {
+            return "(no platform info)".into();
+        }
+
+        if platforms.len() > MAX_PLATFORMS_IN_ERROR {
+            let truncated: Vec<_> = platforms.into_iter().take(MAX_PLATFORMS_IN_ERROR).collect();
+            format!("{}, ...", truncated.join(", ")).into()
+        } else {
+            platforms.join(", ").into()
+        }
+    }
+
+    /// Check if a platform is compatible with the native platform.
+    ///
+    /// Platform has additional optional fields (variant, os_version,
+    /// os_features, features) which are primarily used for Windows images.
+    /// We only compare architecture and OS for compatibility.
+    fn platform_compatible(platform: &Platform, native: &Platform) -> bool {
+        platform.architecture() == native.architecture() && platform.os() == native.os()
     }
 
     /// Verify a single manifest and all of its referenced objects.
@@ -858,9 +1063,47 @@ where
 #[cfg(test)]
 mod tests {
     use cap_std::fs::OpenOptions;
-    use oci_spec::image::HistoryBuilder;
+    use oci_spec::image::{Arch, HistoryBuilder, Os};
 
     use super::*;
+
+    /// Create a new temporary OCI directory for testing.
+    fn new_ocidir() -> Result<(cap_tempfile::TempDir, OciDir)> {
+        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        let w = OciDir::ensure(td.try_clone()?)?;
+        Ok((td, w))
+    }
+
+    /// Build an empty `ImageConfiguration` with all defaults.
+    fn new_empty_config() -> oci_image::ImageConfiguration {
+        oci_image::ImageConfigurationBuilder::default()
+            .build()
+            .unwrap()
+    }
+
+    /// Create a gzip layer with the given content bytes and return the completed layer.
+    fn create_test_layer(w: &OciDir, content: &[u8]) -> Result<Layer> {
+        let mut layerw = w.create_gzip_layer(None)?;
+        layerw.write_all(content)?;
+        layerw.complete()
+    }
+
+    /// Create a simple, valid single-manifest image in the OCI directory and return
+    /// the manifest descriptor. The manifest has an empty config and no layers.
+    fn insert_default_manifest(
+        w: &OciDir,
+        tag: Option<&str>,
+    ) -> Result<(oci_image::ImageManifest, Descriptor)> {
+        let manifest = w.new_empty_manifest()?.build()?;
+        let config = new_empty_config();
+        let desc = w.insert_manifest_and_config(
+            manifest.clone(),
+            config,
+            tag,
+            oci_image::Platform::default(),
+        )?;
+        Ok((manifest, desc))
+    }
 
     const MANIFEST_DERIVE: &str = r#"{
         "schemaVersion": 2,
@@ -900,11 +1143,8 @@ mod tests {
 
     #[test]
     fn test_build() -> Result<()> {
-        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
-        let w = OciDir::ensure(td.try_clone()?)?;
-        let mut layerw = w.create_gzip_layer(None)?;
-        layerw.write_all(b"pretend this is a tarball")?;
-        let root_layer = layerw.complete()?;
+        let (_td, w) = new_ocidir()?;
+        let root_layer = create_test_layer(&w, b"pretend this is a tarball")?;
         let root_layer_desc = root_layer.descriptor().build().unwrap();
         assert_eq!(
             root_layer.uncompressed_sha256.digest(),
@@ -925,9 +1165,7 @@ mod tests {
         );
 
         let mut manifest = w.new_empty_manifest()?.build()?;
-        let mut config = oci_image::ImageConfigurationBuilder::default()
-            .build()
-            .unwrap();
+        let mut config = new_empty_config();
         let annotations: Option<HashMap<String, String>> = None;
         w.push_layer(&mut manifest, &mut config, root_layer, "root", annotations);
         {
@@ -975,13 +1213,9 @@ mod tests {
         let found_via_tag = w.find_manifest_with_tag("latest").unwrap().unwrap();
         assert_eq!(found_via_tag, read_manifest);
 
-        let mut layerw = w.create_gzip_layer(None)?;
-        layerw.write_all(b"pretend this is an updated tarball")?;
-        let root_layer = layerw.complete()?;
+        let root_layer = create_test_layer(&w, b"pretend this is an updated tarball")?;
         let mut manifest = w.new_empty_manifest()?.build()?;
-        let mut config = oci_image::ImageConfigurationBuilder::default()
-            .build()
-            .unwrap();
+        let mut config = new_empty_config();
         w.push_layer(&mut manifest, &mut config, root_layer, "root", None);
         let _: Descriptor = w.insert_manifest_and_config(
             manifest,
@@ -996,8 +1230,7 @@ mod tests {
 
     #[test]
     fn test_complete_verified_as() -> Result<()> {
-        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
-        let oci_dir = OciDir::ensure(td.try_clone()?)?;
+        let (_td, oci_dir) = new_ocidir()?;
 
         // Test a successful write
         let empty_json_digest = oci_image::DescriptorBuilder::default()
@@ -1046,8 +1279,7 @@ mod tests {
 
     #[test]
     fn test_new_empty_manifest() -> Result<()> {
-        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
-        let w = OciDir::ensure(td.try_clone()?)?;
+        let (_td, w) = new_ocidir()?;
 
         let manifest = w.new_empty_manifest()?.build()?;
         let desc: Descriptor =
@@ -1061,16 +1293,11 @@ mod tests {
 
     #[test]
     fn test_push_layer_with_history() -> Result<()> {
-        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
-        let w = OciDir::ensure(td.try_clone()?)?;
+        let (_td, w) = new_ocidir()?;
 
         let mut manifest = w.new_empty_manifest()?.build()?;
-        let mut config = oci_image::ImageConfigurationBuilder::default()
-            .build()
-            .unwrap();
-        let mut layerw = w.create_gzip_layer(None)?;
-        layerw.write_all(b"pretend this is a tarball")?;
-        let root_layer = layerw.complete()?;
+        let mut config = new_empty_config();
+        let root_layer = create_test_layer(&w, b"pretend this is a tarball")?;
 
         let history = HistoryBuilder::default()
             .created_by("/bin/pretend-tar")
@@ -1082,6 +1309,232 @@ mod tests {
             assert_eq!(history.created_by().as_deref().unwrap(), "/bin/pretend-tar");
             assert_eq!(history.created().as_ref(), None);
         }
+        Ok(())
+    }
+
+    /// Build a manifest descriptor for a foreign platform (used in table-driven tests).
+    fn build_foreign_platform_desc(w: &OciDir, arch: Arch, os: Os) -> Result<Descriptor> {
+        let manifest = w.new_empty_manifest()?.build()?;
+        let manifest_desc = w
+            .write_json_blob(&manifest, MediaType::ImageManifest)?
+            .build()?;
+        w.write_config(new_empty_config())?;
+
+        Ok(oci_image::DescriptorBuilder::default()
+            .media_type(MediaType::ImageManifest)
+            .digest(manifest_desc.digest().clone())
+            .size(manifest_desc.size())
+            .platform(
+                oci_image::PlatformBuilder::default()
+                    .architecture(arch)
+                    .os(os)
+                    .build()
+                    .unwrap(),
+            )
+            .build()?)
+    }
+
+    /// What we expect from an `open_image_this_platform` call.
+    enum PlatformExpected {
+        /// Should succeed; optionally assert source_index presence.
+        Ok { has_source_index: Option<bool> },
+        /// Should fail with EmptyImageIndex.
+        ErrEmpty,
+        /// Should fail with NoMatchingPlatform (optionally check `available` contains a substring).
+        ErrNoMatch {
+            available_contains: Option<&'static str>,
+        },
+        /// Should fail with TagNotFound.
+        ErrTagNotFound,
+    }
+
+    /// Setup function that prepares an OCI directory for a test case.
+    type TestSetupFn = Box<dyn Fn(&OciDir) -> Result<()>>;
+
+    /// A single test case for `open_image_this_platform`.
+    struct PlatformTestCase {
+        name: &'static str,
+        setup: TestSetupFn,
+        tag: Option<&'static str>,
+        expected: PlatformExpected,
+    }
+
+    #[test]
+    fn test_open_image_this_platform() -> Result<()> {
+        let cases: Vec<PlatformTestCase> = vec![
+            PlatformTestCase {
+                name: "single manifest with platform",
+                setup: Box::new(|w| {
+                    let mut manifest = w.new_empty_manifest()?.build()?;
+                    let config_desc = w.write_config(new_empty_config())?;
+                    manifest.set_config(config_desc);
+                    w.replace_with_single_manifest(manifest, oci_image::Platform::default())?;
+                    Ok(())
+                }),
+                tag: None,
+                expected: PlatformExpected::Ok {
+                    has_source_index: Some(false),
+                },
+            },
+            PlatformTestCase {
+                name: "single manifest without platform info",
+                setup: Box::new(|w| {
+                    let manifest = w.new_empty_manifest()?.build()?;
+                    let manifest_desc = w
+                        .write_json_blob(&manifest, MediaType::ImageManifest)?
+                        .build()?;
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![manifest_desc])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::ErrNoMatch {
+                    available_contains: None,
+                },
+            },
+            PlatformTestCase {
+                name: "insert with native platform",
+                setup: Box::new(|w| {
+                    insert_default_manifest(w, None)?;
+                    Ok(())
+                }),
+                tag: None,
+                expected: PlatformExpected::Ok {
+                    has_source_index: None,
+                },
+            },
+            PlatformTestCase {
+                name: "find by tag",
+                setup: Box::new(|w| {
+                    insert_default_manifest(w, Some("v1.0"))?;
+                    Ok(())
+                }),
+                tag: Some("v1.0"),
+                expected: PlatformExpected::Ok {
+                    has_source_index: None,
+                },
+            },
+            PlatformTestCase {
+                name: "missing tag",
+                setup: Box::new(|w| {
+                    insert_default_manifest(w, Some("v1.0"))?;
+                    Ok(())
+                }),
+                tag: Some("nonexistent"),
+                expected: PlatformExpected::ErrTagNotFound,
+            },
+            PlatformTestCase {
+                name: "empty index",
+                setup: Box::new(|w| {
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::ErrEmpty,
+            },
+            PlatformTestCase {
+                name: "no matching platform (foreign arches only)",
+                setup: Box::new(|w| {
+                    let desc1 = build_foreign_platform_desc(w, Arch::ARM64, Os::Linux)?;
+                    let desc2 = build_foreign_platform_desc(w, Arch::ARM, Os::Linux)?;
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![desc1, desc2])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::ErrNoMatch {
+                    available_contains: Some("linux"),
+                },
+            },
+            PlatformTestCase {
+                name: "nested index (manifest list peeling)",
+                setup: Box::new(|w| {
+                    let mut manifest = w.new_empty_manifest()?.build()?;
+                    let config_desc = w.write_config(new_empty_config())?;
+                    manifest.set_config(config_desc);
+                    let manifest_desc = w
+                        .write_json_blob(&manifest, MediaType::ImageManifest)?
+                        .platform(oci_image::Platform::default())
+                        .build()?;
+
+                    let nested_index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![manifest_desc])
+                        .build()?;
+                    let mut blob_writer = w.create_blob()?;
+                    let nested_json = nested_index.to_string()?;
+                    blob_writer.write_all(nested_json.as_bytes())?;
+                    let nested_blob = blob_writer.complete()?;
+
+                    let nested_desc = oci_image::DescriptorBuilder::default()
+                        .media_type(MediaType::ImageIndex)
+                        .digest(nested_blob.sha256().clone())
+                        .size(nested_json.len() as u64)
+                        .build()?;
+                    let top_index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![nested_desc])
+                        .build()?;
+                    w.write_index(&top_index)
+                }),
+                tag: None,
+                expected: PlatformExpected::Ok {
+                    has_source_index: Some(true),
+                },
+            },
+        ];
+
+        for case in &cases {
+            let (_td, w) = new_ocidir()?;
+            (case.setup)(&w)?;
+            let result = w.open_image_this_platform(case.tag);
+
+            let name = case.name;
+            match &case.expected {
+                PlatformExpected::Ok { has_source_index } => {
+                    let resolved = result
+                        .unwrap_or_else(|e| panic!("case '{name}': expected Ok, got Err({e})"));
+                    if let Some(expect_index) = has_source_index {
+                        assert_eq!(
+                            resolved.source_index.is_some(),
+                            *expect_index,
+                            "case '{name}': source_index presence mismatch"
+                        );
+                    }
+                }
+                PlatformExpected::ErrEmpty => {
+                    assert!(
+                        matches!(result, Err(Error::EmptyImageIndex)),
+                        "case '{name}': expected EmptyImageIndex, got {result:?}"
+                    );
+                }
+                PlatformExpected::ErrNoMatch { available_contains } => match &result {
+                    Err(Error::NoMatchingPlatform { available, .. }) => {
+                        if let Some(substr) = available_contains {
+                            assert!(
+                                available.contains(substr),
+                                "case '{name}': expected '{substr}' in available '{available}'"
+                            );
+                        }
+                    }
+                    other => panic!("case '{name}': expected NoMatchingPlatform, got {other:?}"),
+                },
+                PlatformExpected::ErrTagNotFound => {
+                    assert!(
+                        matches!(result, Err(Error::TagNotFound { .. })),
+                        "case '{name}': expected TagNotFound, got {result:?}"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
