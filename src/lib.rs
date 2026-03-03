@@ -31,6 +31,12 @@ const BLOBDIR: &str = "blobs/sha256";
 
 const OCI_TAG_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 
+/// By default, an 8K buffer is used which is not optimal in general for larger
+/// files, which blobs usually are. See also coreutils which uses a 128K buffer:
+/// https://github.com/coreutils/coreutils/blob/6a3d2883/src/ioblksize.h -- and
+/// Rust discussions in https://github.com/rust-lang/rust/issues/49921.
+const BLOB_BUF_SIZE: usize = 128 * 1024;
+
 /// Errors returned by this crate.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -895,7 +901,10 @@ impl<'a> BlobWriter<'a> {
         Ok(Self {
             hash: Hasher::new(MessageDigest::sha256())?,
             // FIXME add ability to choose filename after completion
-            target: Some(BufWriter::new(cap_tempfile::TempFile::new(ocidir)?)),
+            target: Some(BufWriter::with_capacity(
+                BLOB_BUF_SIZE,
+                cap_tempfile::TempFile::new(ocidir)?,
+            )),
             size: 0,
         })
     }
