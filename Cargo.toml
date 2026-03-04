@@ -30,3 +30,24 @@ cap-tempfile = "4.0"
 [features]
 zstd = ["dep:zstd"]
 zstdmt = ["zstd", "zstd/zstdmt"]
+
+# Synchronized with https://github.com/bootc-dev/bootc/blob/main/Cargo.toml
+[lints.rust]
+# No unsafe code in this crate
+unsafe_code = "forbid"
+# Absolutely must handle errors
+unused_must_use = "forbid"
+# missing_docs is set per-target via #![deny(missing_docs)] in lib.rs
+# because cargo lints apply to all targets including examples.
+missing_debug_implementations = "deny"
+# Feel free to comment this one out locally during development of a patch.
+dead_code = "deny"
+
+[lints.clippy]
+# These should only be in local code
+dbg_macro = "deny"
+todo = "deny"
+# These two are in my experience the lints which are most likely
+# to trigger, and among the least valuable to fix.
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
