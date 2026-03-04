@@ -344,6 +344,15 @@ impl OciDir {
         Ok(LayerWriter::new(create(bw)?, media_type))
     }
 
+    /// Create a writer for a new uncompressed layer.
+    ///
+    /// This skips computing a separate uncompressed digest (diffid) since the
+    /// blob content is identical to the uncompressed content.
+    pub fn create_uncompressed_layer(&self) -> Result<LayerWriter<'_, BlobWriter<'_>>> {
+        let bw = BlobWriter::new(&self.dir)?;
+        Ok(LayerWriter::new_uncompressed(bw, MediaType::ImageLayer))
+    }
+
     /// Create a writer for a new gzip+tar blob; the contents
     /// are not parsed, but are expected to be a tarball.
     pub fn create_gzip_layer<'a>(
@@ -975,6 +984,13 @@ where
     }
 }
 
+// This is used in the uncompressed path.
+impl<'a> WriteComplete<BlobWriter<'a>> for BlobWriter<'a> {
+    fn complete(self) -> std::io::Result<Self> {
+        Ok(self)
+    }
+}
+
 #[cfg(feature = "zstd")]
 impl<W> WriteComplete<W> for zstd::Encoder<'_, W>
 where
@@ -999,7 +1015,10 @@ impl<'a, W> LayerWriter<'a, W>
 where
     W: WriteComplete<BlobWriter<'a>>,
 {
-    /// Create a new LayerWriter with the given inner writer and media type
+    /// Create a new LayerWriter with the given inner writer and media type.
+    ///
+    /// This computes a separate SHA-256 digest of the uncompressed data
+    /// (the "diffid") inline as data is written.
     pub fn new(inner: W, media_type: oci_image::MediaType) -> Self {
         Self {
             inner: Sha256Writer::new(inner),
@@ -1008,10 +1027,28 @@ where
         }
     }
 
-    /// Complete the layer writing and return the layer descriptor
+    /// Create a new LayerWriter that skips computing a separate uncompressed
+    /// digest.
+    ///
+    /// The blob digest is used as the diffid. This is correct when the encoder
+    /// does not transform the data (i.e. no compression), since the blob
+    /// content is identical to the uncompressed content.
+    pub fn new_uncompressed(inner: W, media_type: oci_image::MediaType) -> Self {
+        Self {
+            inner: Sha256Writer::new_passthrough(inner),
+            media_type,
+            marker: PhantomData,
+        }
+    }
+
+    /// Complete the layer writing and return the layer descriptor.
     pub fn complete(self) -> Result<Layer> {
         let (uncompressed_sha256, enc) = self.inner.finish();
         let blob = enc.complete()?.complete()?;
+        // NB: None here means that a separate uncompressed digest wasn't
+        // calculated because the underlying blob writer is itself uncompressed.
+        // So we can just reuse its calculated digest.
+        let uncompressed_sha256 = uncompressed_sha256.unwrap_or_else(|| blob.sha256().clone());
         Ok(Layer {
             blob,
             uncompressed_sha256,
@@ -1033,24 +1070,40 @@ where
     }
 }
 
-/// Wraps a writer and calculates the sha256 digest of data written to the inner writer
+/// Wraps a writer and optionally calculates the SHA-256 digest of data written
+/// to the inner writer.
+///
+/// When created with [`Sha256Writer::new`], a SHA-256 digest is computed
+/// inline. When created with [`Sha256Writer::new_passthrough`], no hashing is
+/// performed and all writes pass through directly to the inner writer.
 struct Sha256Writer<W> {
     inner: W,
-    sha: openssl::sha::Sha256,
+    sha: Option<openssl::sha::Sha256>,
 }
 
 impl<W> Sha256Writer<W> {
     pub(crate) fn new(inner: W) -> Self {
         Self {
             inner,
-            sha: openssl::sha::Sha256::new(),
+            sha: Some(openssl::sha::Sha256::new()),
         }
     }
 
-    /// Return the hex encoded sha256 digest of the written data, and the underlying writer
-    pub(crate) fn finish(self) -> (Sha256Digest, W) {
-        let digest = hex::encode(self.sha.finish());
-        (Sha256Digest::from_str(&digest).unwrap(), self.inner)
+    /// Create a passthrough writer that does not compute a digest. Embedding
+    /// passthrough directly into this type avoids complicating the LayerWriter
+    /// generics... this is a private API anyway.
+    pub(crate) fn new_passthrough(inner: W) -> Self {
+        Self { inner, sha: None }
+    }
+
+    /// Return the hex-encoded sha256 digest of the written data (if computed),
+    /// and the underlying writer.
+    pub(crate) fn finish(self) -> (Option<Sha256Digest>, W) {
+        let digest = self.sha.map(|sha| {
+            let hex = hex::encode(sha.finish());
+            Sha256Digest::from_str(&hex).unwrap()
+        });
+        (digest, self.inner)
     }
 }
 
@@ -1060,7 +1113,9 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let len = self.inner.write(buf)?;
-        self.sha.update(&buf[..len]);
+        if let Some(ref mut sha) = self.sha {
+            sha.update(&buf[..len]);
+        }
         Ok(len)
     }
 
@@ -1543,6 +1598,46 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_uncompressed_layer() -> Result<()> {
+        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        let w = OciDir::ensure(td.try_clone()?)?;
+
+        let data = b"pretend this is an uncompressed tarball";
+
+        let mut gz = w.create_gzip_layer(None)?;
+        gz.write_all(data)?;
+        let gz_layer = gz.complete()?;
+
+        let mut uncompressed = w.create_uncompressed_layer()?;
+        uncompressed.write_all(data)?;
+        let uncompressed_layer = uncompressed.complete()?;
+
+        // sanity-check the gzip blob digest is different from the diffid (i.e.
+        // ensure we actually calculated two digests)
+        assert_ne!(
+            gz_layer.blob.sha256().digest(),
+            gz_layer.uncompressed_sha256.digest(),
+            "gz layer blob digest should not match diffid"
+        );
+
+        // sanity-check the uncompressed blob digest is the same as its diffid
+        assert_eq!(
+            uncompressed_layer.blob.sha256().digest(),
+            uncompressed_layer.uncompressed_sha256.digest(),
+            "uncompressed layer blob digest should match diffid"
+        );
+
+        // sanity-check their diffids are identical
+        assert_eq!(
+            gz_layer.uncompressed_sha256.digest(),
+            uncompressed_layer.uncompressed_sha256.digest(),
+            "uncompressed layer diffid should equal gz layer diffid"
+        );
 
         Ok(())
     }
