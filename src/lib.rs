@@ -1011,6 +1011,17 @@ where
     marker: PhantomData<&'a ()>,
 }
 
+impl<'a, W> std::fmt::Debug for LayerWriter<'a, W>
+where
+    W: WriteComplete<BlobWriter<'a>>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayerWriter")
+            .field("media_type", &self.media_type)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, W> LayerWriter<'a, W>
 where
     W: WriteComplete<BlobWriter<'a>>,

@@ -1,6 +1,3 @@
-# Maintained in https://github.com/coreos/repo-templates
-# Do not edit downstream.
-
 name: Rust
 on:
   push:
@@ -17,53 +14,31 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned toolchain for linting
-  ACTIONS_LINTS_TOOLCHAIN: 1.86.0
 
 jobs:
   semver-checks:
     name: Semver Checks
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - uses: obi1kenobi/cargo-semver-checks-action@v2
       with:
         # Pinned until cargo-semver-checks supports rustdoc format v57 (Rust 1.93+)
         rust-toolchain: "1.92.0"
 
-  tests-stable:
-    name: Tests, stable toolchain
+  build-test-lint:
+    name: Build, Test & Lint
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        uses: bootc-dev/actions/setup-rust@main
+      - name: Install tools
+        uses: taiki-e/install-action@v2
         with:
-          toolchain: stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: cargo build
-        run: cargo build --all-targets --all-features
-      - name: cargo test
-        run: cargo test --all-targets --all-features
-      # https://github.com/rust-lang/cargo/issues/6669
-      - name: cargo test --doc
-        run: cargo test --doc --all-features
-  linting:
-    name: Lints, pinned toolchain
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.ACTIONS_LINTS_TOOLCHAIN }}
-          components: rustfmt, clippy
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: cargo fmt (check)
-        run: cargo fmt -- --check -l
-      - name: cargo clippy (warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          tool: just
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+      - name: just ci
+        run: just ci
