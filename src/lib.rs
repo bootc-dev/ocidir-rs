@@ -560,45 +560,54 @@ impl OciDir {
     }
 
     /// Write a manifest as a blob, and replace the index with a reference to it.
+    ///
+    /// When the manifest has a `subject` field (i.e. it is a referrer artifact),
+    /// the `artifact_type` and `annotations` from the manifest are automatically
+    /// propagated to the descriptor in the index, as required by the OCI
+    /// distribution spec's Referrers API.
+    ///
+    /// If the manifest has an explicit `artifact_type`, that value is used on the
+    /// descriptor. Otherwise, if the manifest has a `subject`, the descriptor's
+    /// `artifact_type` falls back to `config.mediaType` (per the spec).
     pub fn insert_manifest(
         &self,
         manifest: oci_image::ImageManifest,
         tag: Option<&str>,
         platform: oci_image::Platform,
     ) -> Result<Descriptor> {
-        let mut manifest = self
+        let mut desc_builder = self
             .write_json_blob(&manifest, MediaType::ImageManifest)?
-            .platform(platform)
-            .build()
-            .unwrap();
-        if let Some(tag) = tag {
-            let annotations: HashMap<_, _> = [(OCI_TAG_ANNOTATION.to_string(), tag.to_string())]
-                .into_iter()
-                .collect();
-            manifest.set_annotations(Some(annotations));
+            .platform(platform);
+
+        // Per the OCI distribution spec, descriptors in the index for manifests
+        // with a `subject` must carry `artifactType` and all annotations from
+        // the manifest. This enables the Referrers API to work without fetching
+        // each manifest blob.
+        if manifest.subject().is_some() {
+            let effective_artifact_type = manifest
+                .artifact_type()
+                .clone()
+                .unwrap_or_else(|| manifest.config().media_type().clone());
+            desc_builder = desc_builder.artifact_type(effective_artifact_type);
+
+            // Copy manifest-level annotations to the descriptor
+            if let Some(annos) = manifest.annotations() {
+                desc_builder = desc_builder.annotations(annos.clone());
+            }
+        } else if let Some(at) = manifest.artifact_type() {
+            // Even without a subject, propagate artifact_type if set
+            desc_builder = desc_builder.artifact_type(at.clone());
         }
 
-        let index = match self.read_index() {
-            Ok(mut index) => {
-                let mut manifests = index.manifests().clone();
-                if let Some(tag) = tag {
-                    manifests.retain(|d| !Self::descriptor_is_tagged(d, tag));
-                }
-                manifests.push(manifest.clone());
-                index.set_manifests(manifests);
-                index
-            }
-            Err(Error::MissingImageIndex) => oci_image::ImageIndexBuilder::default()
-                .schema_version(oci_image::SCHEMA_VERSION)
-                .manifests(vec![manifest.clone()])
-                .build()?,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        let mut manifest_desc = desc_builder.build()?;
+        if let Some(tag) = tag {
+            let mut annotations = manifest_desc.annotations().clone().unwrap_or_default();
+            annotations.insert(OCI_TAG_ANNOTATION.to_string(), tag.to_string());
+            manifest_desc.set_annotations(Some(annotations));
+        }
 
-        self.write_index(&index)?;
-        Ok(manifest)
+        self.append_to_index(manifest_desc.clone(), tag)?;
+        Ok(manifest_desc)
     }
 
     /// Write an `ImageIndex` to `index.json` using canonical JSON formatting.
@@ -624,6 +633,153 @@ impl OciDir {
         let config = self.write_config(config)?;
         manifest.set_config(config);
         self.insert_manifest(manifest, tag, platform)
+    }
+
+    /// Create and insert an artifact manifest that references another manifest
+    /// via the `subject` field.
+    ///
+    /// This creates an OCI artifact manifest with the given `artifact_type`,
+    /// pointing to `subject` as the referenced manifest. The artifact's config
+    /// is set to the [empty descriptor][empty] and layers contain the provided
+    /// content blobs (or a single empty descriptor if no layers are provided).
+    ///
+    /// Per the [OCI image spec][artifact-usage], when `config.mediaType` is set
+    /// to the empty value, `artifact_type` MUST be defined.
+    ///
+    /// The resulting descriptor in the index carries `artifact_type` and all
+    /// manifest annotations, enabling the [Referrers API][referrers] to list
+    /// this artifact without fetching the manifest blob.
+    ///
+    /// Unlike [`insert_manifest`](Self::insert_manifest), the descriptor in
+    /// the index does not carry a `platform` field, since artifacts are not
+    /// platform-specific.
+    ///
+    /// [empty]: https://github.com/opencontainers/image-spec/blob/main/manifest.md#guidance-for-an-empty-descriptor
+    /// [artifact-usage]: https://github.com/opencontainers/image-spec/blob/main/manifest.md#guidelines-for-artifact-usage
+    /// [referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+    pub fn insert_artifact_manifest(
+        &self,
+        subject: Descriptor,
+        artifact_type: MediaType,
+        layers: Vec<Descriptor>,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Result<Descriptor> {
+        let empty_descriptor = self.empty_config_descriptor()?;
+
+        // Per the spec, if no layers are provided, use a single empty
+        // descriptor as a placeholder layer.
+        let layers = if layers.is_empty() {
+            vec![empty_descriptor.clone()]
+        } else {
+            layers
+        };
+
+        let mut manifest_builder = oci_image::ImageManifestBuilder::default()
+            .schema_version(oci_image::SCHEMA_VERSION)
+            .config(empty_descriptor)
+            .layers(layers)
+            .artifact_type(artifact_type.clone())
+            .subject(subject);
+
+        if let Some(annos) = annotations {
+            manifest_builder = manifest_builder.annotations(annos);
+        }
+
+        let manifest = manifest_builder.build()?;
+
+        // Write the manifest blob and build a descriptor without a platform
+        // field. We propagate artifact_type and annotations to the descriptor
+        // for the Referrers API, as required by the OCI distribution spec.
+        let mut desc_builder = self
+            .write_json_blob(&manifest, MediaType::ImageManifest)?
+            .artifact_type(artifact_type);
+
+        if let Some(annos) = manifest.annotations() {
+            desc_builder = desc_builder.annotations(annos.clone());
+        }
+
+        let manifest_desc = desc_builder.build()?;
+        self.append_to_index(manifest_desc.clone(), None)?;
+        Ok(manifest_desc)
+    }
+
+    /// Append a descriptor to the index, optionally replacing any existing
+    /// entry with the same tag.
+    fn append_to_index(&self, desc: Descriptor, tag: Option<&str>) -> Result<()> {
+        let index = match self.read_index() {
+            Ok(mut index) => {
+                let mut manifests = index.manifests().clone();
+                if let Some(tag) = tag {
+                    manifests.retain(|d| !Self::descriptor_is_tagged(d, tag));
+                }
+                manifests.push(desc);
+                index.set_manifests(manifests);
+                index
+            }
+            Err(Error::MissingImageIndex) => oci_image::ImageIndexBuilder::default()
+                .schema_version(oci_image::SCHEMA_VERSION)
+                .manifests(vec![desc])
+                .build()?,
+            Err(e) => return Err(e),
+        };
+        self.write_index(&index)
+    }
+
+    /// Find all descriptors in the index that reference the given subject
+    /// digest, as required by the [Referrers API][referrers].
+    ///
+    /// Returns descriptors from the index whose corresponding manifest has a
+    /// `subject` field matching the given digest. The returned descriptors
+    /// include `artifact_type` and annotations as required by the spec.
+    ///
+    /// The `artifact_type_filter` parameter optionally filters results to only
+    /// include referrers with a matching `artifact_type`.
+    ///
+    /// Note: this reads each manifest blob from disk to inspect its `subject`
+    /// field, so the cost scales with the number of manifests in the index.
+    ///
+    /// [referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+    pub fn find_referrers(
+        &self,
+        subject_digest: &Digest,
+        artifact_type_filter: Option<&MediaType>,
+    ) -> Result<Vec<Descriptor>> {
+        let index = self.read_index()?;
+        let mut referrers = Vec::new();
+
+        for desc in index.manifests() {
+            // Only image manifests can carry a subject field; skip image
+            // indices and other media types to avoid deserialization errors.
+            if desc.media_type() != &MediaType::ImageManifest {
+                continue;
+            }
+
+            let manifest: ImageManifest = self.read_json_blob(desc)?;
+
+            let subject = match manifest.subject() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if subject.digest() != subject_digest {
+                continue;
+            }
+
+            // Apply artifact_type filter if requested
+            if let Some(filter) = artifact_type_filter {
+                let effective_type = manifest
+                    .artifact_type()
+                    .as_ref()
+                    .unwrap_or(manifest.config().media_type());
+                if effective_type != filter {
+                    continue;
+                }
+            }
+
+            referrers.push(desc.clone());
+        }
+
+        Ok(referrers)
     }
 
     /// Write a manifest as a blob, and replace the index with a reference to it.
@@ -859,10 +1015,24 @@ impl OciDir {
             MediaType::EmptyJSON => {
                 let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
             }
-            media_type => {
-                return Err(Error::UnexpectedMediaType {
-                    media_type: media_type.clone(),
-                });
+            // Per the OCI image spec, implementations MUST NOT error on
+            // encountering an unknown config mediaType. For artifacts with
+            // custom config types, verify the blob digest matches.
+            _ => {
+                let mut f = self.read_blob(manifest.config())?;
+                let mut digest = Hasher::new(MessageDigest::sha256())?;
+                std::io::copy(&mut f, &mut digest)?;
+                let found = hex::encode(
+                    digest
+                        .finish()
+                        .map_err(|e| Error::Other(e.to_string().into()))?,
+                );
+                if config_digest != found {
+                    return Err(Error::DigestMismatch {
+                        expected: config_digest.into(),
+                        found: found.into(),
+                    });
+                }
             }
         }
         validated.insert(config_digest.into());
@@ -1649,6 +1819,403 @@ mod tests {
             uncompressed_layer.uncompressed_sha256.digest(),
             "uncompressed layer diffid should equal gz layer diffid"
         );
+
+        Ok(())
+    }
+
+    /// Test cases for artifact and referrer functionality.
+    struct ArtifactTestCase {
+        name: &'static str,
+        /// Artifact type to use
+        artifact_type: &'static str,
+        /// Whether to include a content layer
+        has_content_layer: bool,
+        /// Annotations to set on the artifact manifest
+        annotations: Option<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn test_insert_artifact_manifest() -> Result<()> {
+        let cases = vec![
+            ArtifactTestCase {
+                name: "minimal artifact (no layers, no annotations)",
+                artifact_type: "application/vnd.example.sbom.v1",
+                has_content_layer: false,
+                annotations: None,
+            },
+            ArtifactTestCase {
+                name: "artifact with content layer",
+                artifact_type: "application/vnd.example.signature.v1",
+                has_content_layer: true,
+                annotations: None,
+            },
+            ArtifactTestCase {
+                name: "artifact with annotations",
+                artifact_type: "application/vnd.example.attestation.v1",
+                has_content_layer: false,
+                annotations: Some(
+                    [
+                        (
+                            "org.opencontainers.image.created".into(),
+                            "2024-01-01T00:00:00Z".into(),
+                        ),
+                        ("com.example.key".into(), "value".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        ];
+
+        for case in &cases {
+            let (_td, w) = new_ocidir()?;
+            let name = case.name;
+
+            // Create a base image to reference
+            let (_, subject_desc) = insert_default_manifest(&w, Some("base"))?;
+
+            // Prepare layers
+            let layers = if case.has_content_layer {
+                let mut blob = w.create_blob()?;
+                blob.write_all(b"artifact content")?;
+                let blob = blob.complete()?;
+                vec![
+                    blob.descriptor()
+                        .media_type(MediaType::Other("application/vnd.example.data".into()))
+                        .build()
+                        .unwrap(),
+                ]
+            } else {
+                vec![]
+            };
+
+            let artifact_type = MediaType::Other(case.artifact_type.into());
+            let desc = w.insert_artifact_manifest(
+                subject_desc.clone(),
+                artifact_type.clone(),
+                layers,
+                case.annotations.clone(),
+            )?;
+
+            // Verify the descriptor in the index carries artifact_type
+            assert_eq!(
+                desc.artifact_type().as_ref(),
+                Some(&artifact_type),
+                "case '{name}': descriptor should carry artifact_type"
+            );
+
+            // Verify the descriptor does NOT carry a platform field
+            assert!(
+                desc.platform().is_none(),
+                "case '{name}': artifact descriptor should not have platform"
+            );
+
+            // Verify annotations are propagated to the descriptor
+            if let Some(expected_annos) = &case.annotations {
+                let desc_annos = desc
+                    .annotations()
+                    .as_ref()
+                    .expect("annotations should be set");
+                for (k, v) in expected_annos {
+                    assert_eq!(
+                        desc_annos.get(k),
+                        Some(v),
+                        "case '{name}': annotation '{k}' should be propagated"
+                    );
+                }
+            }
+
+            // Verify the manifest blob was written correctly
+            let manifest: ImageManifest = w.read_json_blob(&desc)?;
+            assert_eq!(
+                manifest.artifact_type().as_ref(),
+                Some(&artifact_type),
+                "case '{name}': manifest should have artifact_type"
+            );
+            assert_eq!(
+                manifest.subject().as_ref().map(|s| s.digest()),
+                Some(subject_desc.digest()),
+                "case '{name}': manifest subject should match"
+            );
+            assert_eq!(
+                manifest.config().media_type(),
+                &MediaType::EmptyJSON,
+                "case '{name}': config should be empty descriptor"
+            );
+
+            // Verify layers
+            if case.has_content_layer {
+                assert_eq!(
+                    manifest.layers().len(),
+                    1,
+                    "case '{name}': should have one content layer"
+                );
+                assert_ne!(
+                    manifest.layers()[0].media_type(),
+                    &MediaType::EmptyJSON,
+                    "case '{name}': content layer should not be empty"
+                );
+            } else {
+                // Should have single empty layer per spec guidance
+                assert_eq!(
+                    manifest.layers().len(),
+                    1,
+                    "case '{name}': should have one (empty) layer"
+                );
+                assert_eq!(
+                    manifest.layers()[0].media_type(),
+                    &MediaType::EmptyJSON,
+                    "case '{name}': layer should be empty descriptor"
+                );
+            }
+
+            // Verify fsck passes with artifact manifest
+            let validated = w.fsck()?;
+            assert!(
+                validated >= 4,
+                "case '{name}': fsck should validate at least 4 blobs, got {validated}: 
+                 base manifest + base config + artifact manifest + empty config = 4 minimum"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_referrers() -> Result<()> {
+        let (_td, w) = new_ocidir()?;
+
+        // Create a base image
+        let (_, subject_desc) = insert_default_manifest(&w, Some("base"))?;
+
+        // Insert multiple artifact manifests referencing the base image
+        let sbom_type = MediaType::Other("application/vnd.example.sbom.v1".into());
+        let sig_type = MediaType::Other("application/vnd.example.signature.v1".into());
+
+        let sbom_desc = w.insert_artifact_manifest(
+            subject_desc.clone(),
+            sbom_type.clone(),
+            vec![],
+            Some(
+                [("org.example.format".into(), "json".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+        )?;
+
+        let sig_desc =
+            w.insert_artifact_manifest(subject_desc.clone(), sig_type.clone(), vec![], None)?;
+
+        // Create a second base image (with a layer so it has a different digest)
+        // that has no referrers
+        let root_layer = create_test_layer(&w, b"other image content")?;
+        let mut other_manifest = w.new_empty_manifest()?.build()?;
+        let mut other_config = new_empty_config();
+        w.push_layer(
+            &mut other_manifest,
+            &mut other_config,
+            root_layer,
+            "root",
+            None,
+        );
+        let other_desc = w.insert_manifest_and_config(
+            other_manifest,
+            other_config,
+            Some("other"),
+            Platform::default(),
+        )?;
+
+        // Find all referrers for the first subject
+        let referrers = w.find_referrers(subject_desc.digest(), None)?;
+        assert_eq!(referrers.len(), 2, "should find 2 referrers");
+
+        // Verify the referrer descriptors match what we inserted
+        let referrer_digests: HashSet<_> = referrers.iter().map(|d| d.digest().clone()).collect();
+        assert!(
+            referrer_digests.contains(sbom_desc.digest()),
+            "should find SBOM referrer"
+        );
+        assert!(
+            referrer_digests.contains(sig_desc.digest()),
+            "should find signature referrer"
+        );
+
+        // Verify artifact_type and annotations are on the referrer descriptors
+        for r in &referrers {
+            assert!(
+                r.artifact_type().is_some(),
+                "referrer descriptor should carry artifact_type"
+            );
+        }
+
+        // Verify the SBOM referrer's annotations were propagated
+        let sbom_referrer = referrers
+            .iter()
+            .find(|r| r.digest() == sbom_desc.digest())
+            .expect("SBOM referrer should exist");
+        let sbom_annos = sbom_referrer
+            .annotations()
+            .as_ref()
+            .expect("SBOM referrer should have annotations");
+        assert_eq!(
+            sbom_annos.get("org.example.format"),
+            Some(&"json".to_string()),
+            "SBOM referrer should carry manifest annotations"
+        );
+
+        // Filter by artifact_type
+        let sbom_only = w.find_referrers(subject_desc.digest(), Some(&sbom_type))?;
+        assert_eq!(sbom_only.len(), 1, "should find 1 SBOM referrer");
+        assert_eq!(
+            sbom_only[0].artifact_type().as_ref(),
+            Some(&sbom_type),
+            "filtered referrer should be SBOM type"
+        );
+
+        let sig_only = w.find_referrers(subject_desc.digest(), Some(&sig_type))?;
+        assert_eq!(sig_only.len(), 1, "should find 1 signature referrer");
+
+        // No referrers for the other image
+        let no_referrers = w.find_referrers(other_desc.digest(), None)?;
+        assert!(
+            no_referrers.is_empty(),
+            "other image should have no referrers"
+        );
+
+        // No referrers for a nonexistent digest
+        let fake_digest = Digest::from(Sha256Digest::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )?);
+        let no_referrers = w.find_referrers(&fake_digest, None)?;
+        assert!(
+            no_referrers.is_empty(),
+            "nonexistent digest should have no referrers"
+        );
+
+        // Filter with a type that has no matches
+        let unknown_type = MediaType::Other("application/vnd.example.unknown".into());
+        let no_match = w.find_referrers(subject_desc.digest(), Some(&unknown_type))?;
+        assert!(
+            no_match.is_empty(),
+            "unknown type filter should return empty"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_manifest_propagates_artifact_type() -> Result<()> {
+        let (_td, w) = new_ocidir()?;
+
+        // Create a base image
+        let (_, subject_desc) = insert_default_manifest(&w, Some("base"))?;
+
+        // Create a manifest with subject and artifact_type, inserted via
+        // the regular insert_manifest path
+        let artifact_type = MediaType::Other("application/vnd.example.sbom.v1".into());
+        let empty_config = w.empty_config_descriptor()?;
+        let manifest = oci_image::ImageManifestBuilder::default()
+            .schema_version(oci_image::SCHEMA_VERSION)
+            .config(empty_config.clone())
+            .layers(vec![empty_config])
+            .artifact_type(artifact_type.clone())
+            .subject(subject_desc)
+            .annotations(
+                [("com.example.key".into(), "value".into())]
+                    .into_iter()
+                    .collect::<HashMap<String, String>>(),
+            )
+            .build()?;
+
+        let desc = w.insert_manifest(manifest, None, Platform::default())?;
+
+        // The descriptor should have artifact_type propagated
+        assert_eq!(
+            desc.artifact_type().as_ref(),
+            Some(&artifact_type),
+            "descriptor should carry artifact_type from manifest"
+        );
+
+        // The descriptor should have annotations propagated (from the manifest)
+        let annos = desc
+            .annotations()
+            .as_ref()
+            .expect("should have annotations");
+        assert_eq!(
+            annos.get("com.example.key"),
+            Some(&"value".to_string()),
+            "descriptor should carry annotations from manifest"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_artifact_type_fallback_to_config_media_type() -> Result<()> {
+        let (_td, w) = new_ocidir()?;
+
+        // Create a base image
+        let (_, subject_desc) = insert_default_manifest(&w, Some("base"))?;
+
+        // Create a manifest with subject but WITHOUT explicit artifact_type.
+        // Per the spec, the descriptor's artifact_type should fall back to
+        // config.mediaType.
+        let config_type = MediaType::Other("application/vnd.example.config.v1+json".into());
+
+        // Write a config blob with our custom type
+        let mut blob = w.create_blob()?;
+        blob.write_all(b"{}")?;
+        let config_blob = blob.complete()?;
+        let config_desc = config_blob
+            .descriptor()
+            .media_type(config_type.clone())
+            .build()
+            .unwrap();
+
+        let manifest = oci_image::ImageManifestBuilder::default()
+            .schema_version(oci_image::SCHEMA_VERSION)
+            .config(config_desc)
+            .layers(vec![])
+            .subject(subject_desc)
+            .build()?;
+
+        let desc = w.insert_manifest(manifest, None, Platform::default())?;
+
+        // Without explicit artifact_type, should fall back to config.mediaType
+        assert_eq!(
+            desc.artifact_type().as_ref(),
+            Some(&config_type),
+            "descriptor artifact_type should fall back to config.mediaType"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_artifact_fsck() -> Result<()> {
+        let (_td, w) = new_ocidir()?;
+
+        // Create a base image
+        let (_, subject_desc) = insert_default_manifest(&w, Some("base"))?;
+
+        // Insert an artifact referencing the base
+        let artifact_type = MediaType::Other("application/vnd.example.sbom.v1".into());
+
+        // Also write a real content blob
+        let mut blob = w.create_blob()?;
+        blob.write_all(b"sbom content here")?;
+        let content_blob = blob.complete()?;
+        let content_desc = content_blob
+            .descriptor()
+            .media_type(MediaType::Other("application/vnd.example.sbom".into()))
+            .build()
+            .unwrap();
+
+        w.insert_artifact_manifest(subject_desc, artifact_type, vec![content_desc], None)?;
+
+        // fsck should pass with artifact manifests in the index
+        let validated = w.fsck()?;
+        // base manifest + base config + artifact manifest + empty config + content blob = 5
+        assert_eq!(validated, 5, "fsck should validate exactly 5 blobs");
 
         Ok(())
     }
