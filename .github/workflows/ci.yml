@@ -42,3 +42,8 @@ jobs:
         run: rustup component add rustfmt clippy
       - name: just ci
         run: just ci
+      - name: just selftest
+        # The selftest pulls from Docker Hub which may rate-limit shared
+        # GitHub runner IPs. Don't let transient registry failures block CI.
+        continue-on-error: true
+        run: just selftest

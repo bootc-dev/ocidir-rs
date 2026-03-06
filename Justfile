@@ -29,5 +29,9 @@ lint: fmt-check clippy
 semver-check:
     cargo semver-checks
 
+# Run the selftest (pulls busybox, creates artifacts, verifies referrers)
+selftest:
+    cargo run --example ocidir -- selftest
+
 # Lint and test (used by CI, and for local development)
 ci: lint test
