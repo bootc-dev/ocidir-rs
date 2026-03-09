@@ -26,6 +26,10 @@ canon-json = "0.2.0"
 [dev-dependencies]
 anyhow = "1.0.89"
 cap-tempfile = "4.0"
+clap = { version = "4", features = ["derive"] }
+oci-distribution = "0.11"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 zstd = ["dep:zstd"]
