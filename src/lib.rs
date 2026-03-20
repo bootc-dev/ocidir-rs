@@ -1002,13 +1002,9 @@ impl OciDir {
     fn verify_blob_digest(&self, desc: &Descriptor) -> Result<()> {
         let expected = sha256_of_descriptor(desc)?;
         let mut f = self.read_blob(desc)?;
-        let mut digest = Hasher::new(MessageDigest::sha256())?;
-        std::io::copy(&mut f, &mut digest)?;
-        let found = hex::encode(
-            digest
-                .finish()
-                .map_err(|e| Error::Other(e.to_string().into()))?,
-        );
+        let mut hasher = Hasher::new(MessageDigest::sha256())?;
+        std::io::copy(&mut f, &mut hasher)?;
+        let found = hex::encode(hasher.finish()?);
         if expected != found {
             return Err(Error::DigestMismatch {
                 expected: expected.into(),
@@ -1027,21 +1023,23 @@ impl OciDir {
         validated: &mut HashSet<Box<str>>,
     ) -> Result<()> {
         let config_digest = sha256_of_descriptor(manifest.config())?;
-        // Always verify the config blob digest, regardless of media type.
-        self.verify_blob_digest(manifest.config())?;
-        // Additionally validate the content structure for known types.
-        match manifest.config().media_type() {
-            MediaType::ImageConfig => {
-                let _: ImageConfiguration = self.read_json_blob(manifest.config())?;
+        if !validated.contains(config_digest) {
+            // Always verify the config blob digest, regardless of media type.
+            self.verify_blob_digest(manifest.config())?;
+            // Additionally validate the content structure for known types.
+            match manifest.config().media_type() {
+                MediaType::ImageConfig => {
+                    let _: ImageConfiguration = self.read_json_blob(manifest.config())?;
+                }
+                MediaType::EmptyJSON => {
+                    let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
+                }
+                // Per the OCI image spec, implementations MUST NOT error on
+                // encountering an unknown config mediaType.
+                _ => {}
             }
-            MediaType::EmptyJSON => {
-                let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
-            }
-            // Per the OCI image spec, implementations MUST NOT error on
-            // encountering an unknown config mediaType.
-            _ => {}
+            validated.insert(config_digest.into());
         }
-        validated.insert(config_digest.into());
         for layer in manifest.layers() {
             let expected = sha256_of_descriptor(layer)?;
             if validated.contains(expected) {
