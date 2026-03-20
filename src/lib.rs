@@ -545,8 +545,7 @@ impl OciDir {
     ) -> Result<oci_image::Descriptor> {
         Ok(self
             .write_json_blob(&config, MediaType::ImageConfig)?
-            .build()
-            .unwrap())
+            .build()?)
     }
 
     /// Read the image index.
@@ -999,6 +998,26 @@ impl OciDir {
         platform.architecture() == native.architecture() && platform.os() == native.os()
     }
 
+    /// Verify a blob's SHA-256 digest matches its descriptor.
+    fn verify_blob_digest(&self, desc: &Descriptor) -> Result<()> {
+        let expected = sha256_of_descriptor(desc)?;
+        let mut f = self.read_blob(desc)?;
+        let mut digest = Hasher::new(MessageDigest::sha256())?;
+        std::io::copy(&mut f, &mut digest)?;
+        let found = hex::encode(
+            digest
+                .finish()
+                .map_err(|e| Error::Other(e.to_string().into()))?,
+        );
+        if expected != found {
+            return Err(Error::DigestMismatch {
+                expected: expected.into(),
+                found: found.into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Verify a single manifest and all of its referenced objects.
     /// Skips already validated blobs referenced by digest in `validated`,
     /// and updates that set with ones we did validate.
@@ -1008,6 +1027,9 @@ impl OciDir {
         validated: &mut HashSet<Box<str>>,
     ) -> Result<()> {
         let config_digest = sha256_of_descriptor(manifest.config())?;
+        // Always verify the config blob digest, regardless of media type.
+        self.verify_blob_digest(manifest.config())?;
+        // Additionally validate the content structure for known types.
         match manifest.config().media_type() {
             MediaType::ImageConfig => {
                 let _: ImageConfiguration = self.read_json_blob(manifest.config())?;
@@ -1016,24 +1038,8 @@ impl OciDir {
                 let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
             }
             // Per the OCI image spec, implementations MUST NOT error on
-            // encountering an unknown config mediaType. For artifacts with
-            // custom config types, verify the blob digest matches.
-            _ => {
-                let mut f = self.read_blob(manifest.config())?;
-                let mut digest = Hasher::new(MessageDigest::sha256())?;
-                std::io::copy(&mut f, &mut digest)?;
-                let found = hex::encode(
-                    digest
-                        .finish()
-                        .map_err(|e| Error::Other(e.to_string().into()))?,
-                );
-                if config_digest != found {
-                    return Err(Error::DigestMismatch {
-                        expected: config_digest.into(),
-                        found: found.into(),
-                    });
-                }
-            }
+            // encountering an unknown config mediaType.
+            _ => {}
         }
         validated.insert(config_digest.into());
         for layer in manifest.layers() {
@@ -1041,20 +1047,7 @@ impl OciDir {
             if validated.contains(expected) {
                 continue;
             }
-            let mut f = self.read_blob(layer)?;
-            let mut digest = Hasher::new(MessageDigest::sha256())?;
-            std::io::copy(&mut f, &mut digest)?;
-            let found = hex::encode(
-                digest
-                    .finish()
-                    .map_err(|e| Error::Other(e.to_string().into()))?,
-            );
-            if expected != found {
-                return Err(Error::DigestMismatch {
-                    expected: expected.into(),
-                    found: found.into(),
-                });
-            }
+            self.verify_blob_digest(layer)?;
             validated.insert(expected.into());
         }
         Ok(())
