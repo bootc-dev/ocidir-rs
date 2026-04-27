@@ -878,11 +878,9 @@ impl OciDir {
         for desc in candidates {
             match desc.media_type() {
                 MediaType::ImageManifest => {
-                    // Direct manifest in the top-level index
-                    if let Some(platform) = desc.platform().as_ref()
-                        && Self::platform_compatible(platform, &native_platform)
+                    if let Some(manifest) =
+                        self.resolve_descriptor_for_platform(desc, &native_platform)?
                     {
-                        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
                         return Ok(ResolvedManifest {
                             manifest,
                             manifest_descriptor: desc.clone(),
@@ -941,10 +939,9 @@ impl OciDir {
                     return Err(Error::NestedImageIndex);
                 }
                 MediaType::ImageManifest => {
-                    if let Some(platform) = desc.platform().as_ref()
-                        && Self::platform_compatible(platform, native_platform)
+                    if let Some(manifest) =
+                        self.resolve_descriptor_for_platform(desc, native_platform)?
                     {
-                        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
                         return Ok(Some(ResolvedManifest {
                             manifest,
                             manifest_descriptor: desc.clone(),
@@ -996,6 +993,41 @@ impl OciDir {
     /// We only compare architecture and OS for compatibility.
     fn platform_compatible(platform: &Platform, native: &Platform) -> bool {
         platform.architecture() == native.architecture() && platform.os() == native.os()
+    }
+
+    /// Resolve a manifest descriptor for the given platform, reading the config
+    /// blob when the descriptor has no explicit `platform` annotation.
+    ///
+    /// Returns `Ok(Some(manifest))` when `desc` is compatible with `native`,
+    /// `Ok(None)` when it is not, and `Err(_)` on I/O or parse errors.
+    fn resolve_descriptor_for_platform(
+        &self,
+        desc: &Descriptor,
+        native: &Platform,
+    ) -> Result<Option<ImageManifest>> {
+        // Fast path: explicit platform annotation — no blob I/O needed.
+        if let Some(platform) = desc.platform().as_ref() {
+            if Self::platform_compatible(platform, native) {
+                return Ok(Some(self.read_json_blob::<ImageManifest>(desc)?));
+            }
+            return Ok(None);
+        }
+
+        // If there's no annotation then read the manifest and config.
+        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
+
+        // Only image manifests (not OCI artifact manifests) carry a platform in
+        // their config blob. Skip the read entirely for anything else.
+        if manifest.config().media_type() != &MediaType::ImageConfig {
+            return Ok(None);
+        }
+
+        let config: ImageConfiguration = self.read_json_blob(manifest.config())?;
+        if config.architecture() == native.architecture() && config.os() == native.os() {
+            Ok(Some(manifest))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Verify a blob's SHA-256 digest matches its descriptor.
@@ -1687,6 +1719,97 @@ mod tests {
                 tag: None,
                 expected: PlatformExpected::ErrNoMatch {
                     available_contains: Some("linux"),
+                },
+            },
+            PlatformTestCase {
+                // Mirrors what `skopeo copy containers-storage:... oci:/path:tag` produces:
+                // a single-manifest OCI layout where the index entry has no platform
+                // annotation, but the config blob carries the real os/architecture.
+                name: "native config, no platform annotation on descriptor",
+                setup: Box::new(|w| {
+                    let config = oci_image::ImageConfigurationBuilder::default()
+                        .architecture(oci_image::Platform::default().architecture().clone())
+                        .os(oci_image::Platform::default().os().clone())
+                        .build()
+                        .unwrap();
+                    let config_desc = w.write_config(config)?;
+                    let mut manifest = w.new_empty_manifest()?.build()?;
+                    manifest.set_config(config_desc);
+                    // Write the descriptor without a platform field
+                    let manifest_desc = w
+                        .write_json_blob(&manifest, MediaType::ImageManifest)?
+                        .build()?;
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![manifest_desc])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::Ok {
+                    has_source_index: Some(false),
+                },
+            },
+            PlatformTestCase {
+                // A manifest with a foreign config (arm64) and no platform annotation
+                // on the descriptor should still fail to match.
+                name: "foreign config, no platform annotation on descriptor",
+                setup: Box::new(|w| {
+                    let config = oci_image::ImageConfigurationBuilder::default()
+                        .architecture(Arch::ARM64)
+                        .os(Os::Linux)
+                        .build()
+                        .unwrap();
+                    let config_desc = w.write_config(config)?;
+                    let mut manifest = w.new_empty_manifest()?.build()?;
+                    manifest.set_config(config_desc);
+                    let manifest_desc = w
+                        .write_json_blob(&manifest, MediaType::ImageManifest)?
+                        .build()?;
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![manifest_desc])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::ErrNoMatch {
+                    available_contains: None,
+                },
+            },
+            PlatformTestCase {
+                // Mixed-annotation index: the first descriptor has an explicit
+                // foreign-platform annotation (aarch64) and must be skipped; the
+                // second has NO platform annotation but carries a native config blob.
+                // Verifies that the fallback loop continues past annotated mismatches
+                // and still finds the unannotated native match.
+                name: "mixed: annotated foreign first, unannotated native second",
+                setup: Box::new(|w| {
+                    // First entry: explicitly annotated as a foreign platform.
+                    let foreign_desc = build_foreign_platform_desc(w, Arch::ARM64, Os::Linux)?;
+
+                    // Second entry: no platform annotation, but config blob is native.
+                    let native_config = oci_image::ImageConfigurationBuilder::default()
+                        .architecture(oci_image::Platform::default().architecture().clone())
+                        .os(oci_image::Platform::default().os().clone())
+                        .build()
+                        .unwrap();
+                    let native_config_desc = w.write_config(native_config)?;
+                    let mut native_manifest = w.new_empty_manifest()?.build()?;
+                    native_manifest.set_config(native_config_desc);
+                    let native_manifest_desc = w
+                        .write_json_blob(&native_manifest, MediaType::ImageManifest)?
+                        .build()?;
+
+                    let index = oci_image::ImageIndexBuilder::default()
+                        .schema_version(oci_image::SCHEMA_VERSION)
+                        .manifests(vec![foreign_desc, native_manifest_desc])
+                        .build()?;
+                    w.write_index(&index)
+                }),
+                tag: None,
+                expected: PlatformExpected::Ok {
+                    has_source_index: Some(false),
                 },
             },
             PlatformTestCase {
