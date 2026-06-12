@@ -11,6 +11,7 @@ use oci_distribution::secrets::RegistryAuth;
 use ocidir::OciDir;
 use ocidir::cap_std::fs::Dir;
 use ocidir::oci_spec::image::{self as oci_image, Descriptor, ImageManifest, MediaType, Platform};
+use ocidir::prelude::*;
 
 const OCI_TAG_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 

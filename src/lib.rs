@@ -1,6 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+/// Re-exports of commonly used traits.
+///
+/// brings OciRead into scope so that its methods are available on OciDir
+pub mod prelude {
+    pub use crate::OciRead;
+}
+
 use canon_json::CanonicalFormatter;
 use cap_std::fs::{Dir, DirBuilderExt};
 use cap_std_ext::cap_tempfile;
@@ -227,6 +234,390 @@ fn sha256_of_descriptor(desc: &Descriptor) -> Result<&str> {
         .ok_or_else(|| Error::UnsupportedDigestAlgorithm {
             found: desc.digest().to_string().into(),
         })
+}
+
+fn descriptor_is_tagged(d: &Descriptor, tag: &str) -> bool {
+    d.annotations()
+        .as_ref()
+        .and_then(|annos| annos.get(OCI_TAG_ANNOTATION))
+        .filter(|tagval| tagval.as_str() == tag)
+        .is_some()
+}
+
+/// Check if a platform is compatible with the native platform.
+///
+/// Platform has additional optional fields (variant, os_version,
+/// os_features, features) which are primarily used for Windows images.
+/// We only compare architecture and OS for compatibility.
+fn platform_compatible(platform: &Platform, native: &Platform) -> bool {
+    platform.architecture() == native.architecture() && platform.os() == native.os()
+}
+
+/// Format the available platforms from a list of descriptors for error messages.
+/// Limits output to 10 platforms to prevent excessive memory usage.
+fn format_available_platforms<'a>(manifests: impl Iterator<Item = &'a Descriptor>) -> Box<str> {
+    const MAX_PLATFORMS_IN_ERROR: usize = 10;
+
+    let platforms: Vec<_> = manifests
+        .filter_map(|d| {
+            d.platform()
+                .as_ref()
+                .map(|p| format!("{}/{}", p.os(), p.architecture()))
+        })
+        .take(MAX_PLATFORMS_IN_ERROR + 1) // Take one extra to detect truncation
+        .collect();
+
+    if platforms.is_empty() {
+        return "(no platform info)".into();
+    }
+
+    if platforms.len() > MAX_PLATFORMS_IN_ERROR {
+        let truncated: Vec<_> = platforms.into_iter().take(MAX_PLATFORMS_IN_ERROR).collect();
+        format!("{}, ...", truncated.join(", ")).into()
+    } else {
+        platforms.join(", ").into()
+    }
+}
+
+/// Read-only access to an OCI image store.
+///
+/// This trait abstracts over different backends (directory layout, tar archive)
+/// for reading OCI images. Implementors provide three primitives; all higher-level
+/// operations are provided as default methods.
+pub trait OciRead {
+    /// The concrete reader type returned by [`read_blob`](Self::read_blob).
+    type BlobReader: Read + Seek + Send + 'static;
+
+    /// Open a blob for reading, validating its size against the descriptor.
+    fn read_blob(&self, desc: &Descriptor) -> Result<Self::BlobReader>;
+
+    /// Read the image index (`index.json`).
+    fn read_index(&self) -> Result<ImageIndex>;
+
+    /// Returns `true` if the blob with this digest is already present.
+    fn has_blob(&self, desc: &Descriptor) -> Result<bool>;
+
+    /// Returns `true` if the manifest is already present.
+    fn has_manifest(&self, desc: &Descriptor) -> Result<bool> {
+        let index = self.read_index()?;
+        Ok(index
+            .manifests()
+            .iter()
+            .any(|m| m.digest() == desc.digest()))
+    }
+
+    /// Read a JSON blob.
+    fn read_json_blob<T: serde::de::DeserializeOwned>(&self, desc: &Descriptor) -> Result<T> {
+        let blob = BufReader::new(self.read_blob(desc)?);
+        serde_json::from_reader(blob).map_err(Into::into)
+    }
+
+    /// Find the manifest with the provided tag
+    fn find_manifest_with_tag(&self, tag: &str) -> Result<Option<oci_image::ImageManifest>> {
+        let desc = self.find_manifest_descriptor_with_tag(tag)?;
+        desc.map(|img| self.read_json_blob(&img)).transpose()
+    }
+
+    /// Find the manifest descriptor with the provided tag
+    fn find_manifest_descriptor_with_tag(&self, tag: &str) -> Result<Option<Descriptor>> {
+        let idx = self.read_index()?;
+        Ok(idx
+            .manifests()
+            .iter()
+            .find(|desc| descriptor_is_tagged(desc, tag))
+            .cloned())
+    }
+
+    /// Open an image manifest for the current platform.
+    ///
+    /// This resolves the appropriate manifest from the index for the native
+    /// platform (OS and architecture). If `tag` is provided, only manifests
+    /// with that tag annotation are considered.
+    ///
+    /// If the index contains an image index (manifest list), it is "peeled"
+    /// to get the underlying manifests. Nested image indices are not supported.
+    ///
+    /// Returns a [`ResolvedManifest`] containing the manifest, its digest,
+    /// and optionally the image index it was resolved from with its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The index cannot be read
+    /// - The index is empty
+    /// - A tag is specified but not found
+    /// - No manifest matches the native platform
+    /// - A nested image index is encountered
+    fn open_image_this_platform(&self, tag: Option<&str>) -> Result<ResolvedManifest> {
+        let index = self.read_index()?;
+        let manifests = index.manifests();
+
+        // Filter by tag if specified, returning early on empty results
+        let candidates: Vec<_> = if let Some(tag) = tag {
+            let tagged: Vec<_> = manifests
+                .iter()
+                .filter(|d| descriptor_is_tagged(d, tag))
+                .collect();
+            if tagged.is_empty() {
+                return Err(Error::TagNotFound { tag: tag.into() });
+            }
+            tagged
+        } else {
+            if manifests.is_empty() {
+                return Err(Error::EmptyImageIndex);
+            }
+            manifests.iter().collect()
+        };
+
+        // Get the native platform
+        let native_platform = Platform::default();
+
+        // Collect all found candidate descriptors for error reporting
+        let mut found_candidates: Vec<Descriptor> = Vec::new();
+
+        for desc in candidates {
+            match desc.media_type() {
+                MediaType::ImageManifest => {
+                    if let Some(manifest) =
+                        self.resolve_descriptor_for_platform(desc, &native_platform)?
+                    {
+                        return Ok(ResolvedManifest {
+                            manifest,
+                            manifest_descriptor: desc.clone(),
+                            source_index: None,
+                        });
+                    }
+                    found_candidates.push(desc.clone());
+                }
+                MediaType::ImageIndex => {
+                    // Peel the manifest list
+                    let nested: ImageIndex = self.read_json_blob(desc)?;
+                    let index_descriptor = desc.clone();
+
+                    if let Some(resolved) = self.resolve_manifest_list(
+                        nested,
+                        index_descriptor,
+                        &native_platform,
+                        &mut found_candidates,
+                    )? {
+                        return Ok(resolved);
+                    }
+                }
+                other => {
+                    return Err(Error::UnexpectedMediaType {
+                        media_type: other.clone(),
+                    });
+                }
+            }
+        }
+
+        // No match found
+        Err(Error::NoMatchingPlatform {
+            os: native_platform.os().to_string().into(),
+            architecture: native_platform.architecture().to_string().into(),
+            available: format_available_platforms(found_candidates.iter()),
+        })
+    }
+
+    /// Resolve a manifest from an image index (manifest list) for a given platform.
+    ///
+    /// Iterates the manifests within the index, returning the first one that
+    /// matches `native_platform`. Non-matching descriptors are appended to
+    /// `found_candidates` so callers can include them in error messages.
+    ///
+    /// Returns `Ok(None)` if no manifest in this index matched.
+    fn resolve_manifest_list(
+        &self,
+        index: ImageIndex,
+        index_descriptor: Descriptor,
+        native_platform: &Platform,
+        found_candidates: &mut Vec<Descriptor>,
+    ) -> Result<Option<ResolvedManifest>> {
+        for desc in index.manifests() {
+            match desc.media_type() {
+                MediaType::ImageIndex => {
+                    return Err(Error::NestedImageIndex);
+                }
+                MediaType::ImageManifest => {
+                    if let Some(manifest) =
+                        self.resolve_descriptor_for_platform(desc, native_platform)?
+                    {
+                        return Ok(Some(ResolvedManifest {
+                            manifest,
+                            manifest_descriptor: desc.clone(),
+                            source_index: Some((index, index_descriptor)),
+                        }));
+                    }
+                    found_candidates.push(desc.clone());
+                }
+                other => {
+                    return Err(Error::UnexpectedMediaType {
+                        media_type: other.clone(),
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a manifest descriptor for the given platform, reading the config
+    /// blob when the descriptor has no explicit `platform` annotation.
+    ///
+    /// Returns `Ok(Some(manifest))` when `desc` is compatible with `native`,
+    /// `Ok(None)` when it is not, and `Err(_)` on I/O or parse errors.
+    fn resolve_descriptor_for_platform(
+        &self,
+        desc: &Descriptor,
+        native: &Platform,
+    ) -> Result<Option<ImageManifest>> {
+        // Fast path: explicit platform annotation — no blob I/O needed.
+        if let Some(platform) = desc.platform().as_ref() {
+            if platform_compatible(platform, native) {
+                return Ok(Some(self.read_json_blob::<ImageManifest>(desc)?));
+            }
+            return Ok(None);
+        }
+
+        // If there's no annotation then read the manifest and config.
+        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
+
+        // Only image manifests (not OCI artifact manifests) carry a platform in
+        // their config blob. Skip the read entirely for anything else.
+        if manifest.config().media_type() != &MediaType::ImageConfig {
+            return Ok(None);
+        }
+
+        let config: ImageConfiguration = self.read_json_blob(manifest.config())?;
+        if config.architecture() == native.architecture() && config.os() == native.os() {
+            Ok(Some(manifest))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Find all descriptors in the index that reference the given subject
+    /// digest, as required by the [Referrers API][referrers].
+    ///
+    /// Returns descriptors from the index whose corresponding manifest has a
+    /// `subject` field matching the given digest. The returned descriptors
+    /// include `artifact_type` and annotations as required by the spec.
+    ///
+    /// The `artifact_type_filter` parameter optionally filters results to only
+    /// include referrers with a matching `artifact_type`.
+    ///
+    /// Note: this reads each manifest blob from disk to inspect its `subject`
+    /// field, so the cost scales with the number of manifests in the index.
+    ///
+    /// [referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+    fn find_referrers(
+        &self,
+        subject_digest: &Digest,
+        artifact_type_filter: Option<&MediaType>,
+    ) -> Result<Vec<Descriptor>> {
+        let index = self.read_index()?;
+        let mut referrers = Vec::new();
+
+        for desc in index.manifests() {
+            // Only image manifests can carry a subject field; skip image
+            // indices and other media types to avoid deserialization errors.
+            if desc.media_type() != &MediaType::ImageManifest {
+                continue;
+            }
+
+            let manifest: ImageManifest = self.read_json_blob(desc)?;
+
+            let subject = match manifest.subject() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if subject.digest() != subject_digest {
+                continue;
+            }
+
+            // Apply artifact_type filter if requested
+            if let Some(filter) = artifact_type_filter {
+                let effective_type = manifest
+                    .artifact_type()
+                    .as_ref()
+                    .unwrap_or(manifest.config().media_type());
+                if effective_type != filter {
+                    continue;
+                }
+            }
+
+            referrers.push(desc.clone());
+        }
+
+        Ok(referrers)
+    }
+
+    /// Verify a blob's SHA-256 digest matches its descriptor.
+    fn verify_blob_digest(&self, desc: &Descriptor) -> Result<()> {
+        let expected = sha256_of_descriptor(desc)?;
+        let mut f = self.read_blob(desc)?;
+        let mut hasher = Hasher::new(MessageDigest::sha256())?;
+        std::io::copy(&mut f, &mut hasher)?;
+        let found = hex::encode(hasher.finish()?);
+        if expected != found {
+            return Err(Error::DigestMismatch {
+                expected: expected.into(),
+                found: found.into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify a single manifest and all of its referenced objects.
+    /// Skips already validated blobs referenced by digest in `validated`,
+    /// and updates that set with ones we did validate.
+    fn fsck_one_manifest(
+        &self,
+        manifest: &ImageManifest,
+        validated: &mut HashSet<Box<str>>,
+    ) -> Result<()> {
+        let config_digest = sha256_of_descriptor(manifest.config())?;
+        if !validated.contains(config_digest) {
+            // Always verify the config blob digest, regardless of media type.
+            self.verify_blob_digest(manifest.config())?;
+            // Additionally validate the content structure for known types.
+            match manifest.config().media_type() {
+                MediaType::ImageConfig => {
+                    let _: ImageConfiguration = self.read_json_blob(manifest.config())?;
+                }
+                MediaType::EmptyJSON => {
+                    let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
+                }
+                // Per the OCI image spec, implementations MUST NOT error on
+                // encountering an unknown config mediaType.
+                _ => {}
+            }
+            validated.insert(config_digest.into());
+        }
+        for layer in manifest.layers() {
+            let expected = sha256_of_descriptor(layer)?;
+            if validated.contains(expected) {
+                continue;
+            }
+            self.verify_blob_digest(layer)?;
+            validated.insert(expected.into());
+        }
+        Ok(())
+    }
+
+    /// Verify consistency of the index, its manifests, the config and blobs (all the latter)
+    /// by verifying their descriptor.
+    fn fsck(&self) -> Result<u64> {
+        let index = self.read_index()?;
+        let mut validated_blobs = HashSet::new();
+        for manifest_descriptor in index.manifests() {
+            let expected_sha256 = sha256_of_descriptor(manifest_descriptor)?;
+            let manifest: ImageManifest = self.read_json_blob(manifest_descriptor)?;
+            validated_blobs.insert(expected_sha256.into());
+            self.fsck_one_manifest(&manifest, &mut validated_blobs)?;
+        }
+        Ok(validated_blobs.len().try_into().unwrap())
+    }
 }
 
 impl OciDir {
@@ -502,42 +893,6 @@ impl OciDir {
         Ok(PathBuf::from(digest))
     }
 
-    /// Open a blob; its size is validated as a sanity check.
-    pub fn read_blob(&self, desc: &oci_spec::image::Descriptor) -> Result<File> {
-        let path = Self::parse_descriptor_to_path(desc)?;
-        let f = self.blobs_dir.open(path).map(|f| f.into_std())?;
-        let expected: u64 = desc.size();
-        let found = f.metadata()?.len();
-        if expected != found {
-            return Err(Error::SizeMismatch { expected, found });
-        }
-        Ok(f)
-    }
-
-    /// Returns `true` if the blob with this digest is already present.
-    pub fn has_blob(&self, desc: &oci_spec::image::Descriptor) -> Result<bool> {
-        let path = Self::parse_descriptor_to_path(desc)?;
-        self.blobs_dir.try_exists(path).map_err(Into::into)
-    }
-
-    /// Returns `true` if the manifest is already present.
-    pub fn has_manifest(&self, desc: &oci_spec::image::Descriptor) -> Result<bool> {
-        let index = self.read_index()?;
-        Ok(index
-            .manifests()
-            .iter()
-            .any(|m| m.digest() == desc.digest()))
-    }
-
-    /// Read a JSON blob.
-    pub fn read_json_blob<T: serde::de::DeserializeOwned>(
-        &self,
-        desc: &oci_spec::image::Descriptor,
-    ) -> Result<T> {
-        let blob = BufReader::new(self.read_blob(desc)?);
-        serde_json::from_reader(blob).map_err(Into::into)
-    }
-
     /// Write a configuration blob.
     pub fn write_config(
         &self,
@@ -546,16 +901,6 @@ impl OciDir {
         Ok(self
             .write_json_blob(&config, MediaType::ImageConfig)?
             .build()?)
-    }
-
-    /// Read the image index.
-    pub fn read_index(&self) -> Result<ImageIndex> {
-        let r = if let Some(index) = self.dir.open_optional("index.json")?.map(BufReader::new) {
-            oci_image::ImageIndex::from_reader(index)?
-        } else {
-            return Err(Error::MissingImageIndex);
-        };
-        Ok(r)
     }
 
     /// Write a manifest as a blob, and replace the index with a reference to it.
@@ -709,7 +1054,7 @@ impl OciDir {
             Ok(mut index) => {
                 let mut manifests = index.manifests().clone();
                 if let Some(tag) = tag {
-                    manifests.retain(|d| !Self::descriptor_is_tagged(d, tag));
+                    manifests.retain(|d| !descriptor_is_tagged(d, tag));
                 }
                 manifests.push(desc);
                 index.set_manifests(manifests);
@@ -722,63 +1067,6 @@ impl OciDir {
             Err(e) => return Err(e),
         };
         self.write_index(&index)
-    }
-
-    /// Find all descriptors in the index that reference the given subject
-    /// digest, as required by the [Referrers API][referrers].
-    ///
-    /// Returns descriptors from the index whose corresponding manifest has a
-    /// `subject` field matching the given digest. The returned descriptors
-    /// include `artifact_type` and annotations as required by the spec.
-    ///
-    /// The `artifact_type_filter` parameter optionally filters results to only
-    /// include referrers with a matching `artifact_type`.
-    ///
-    /// Note: this reads each manifest blob from disk to inspect its `subject`
-    /// field, so the cost scales with the number of manifests in the index.
-    ///
-    /// [referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
-    pub fn find_referrers(
-        &self,
-        subject_digest: &Digest,
-        artifact_type_filter: Option<&MediaType>,
-    ) -> Result<Vec<Descriptor>> {
-        let index = self.read_index()?;
-        let mut referrers = Vec::new();
-
-        for desc in index.manifests() {
-            // Only image manifests can carry a subject field; skip image
-            // indices and other media types to avoid deserialization errors.
-            if desc.media_type() != &MediaType::ImageManifest {
-                continue;
-            }
-
-            let manifest: ImageManifest = self.read_json_blob(desc)?;
-
-            let subject = match manifest.subject() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if subject.digest() != subject_digest {
-                continue;
-            }
-
-            // Apply artifact_type filter if requested
-            if let Some(filter) = artifact_type_filter {
-                let effective_type = manifest
-                    .artifact_type()
-                    .as_ref()
-                    .unwrap_or(manifest.config().media_type());
-                if effective_type != filter {
-                    continue;
-                }
-            }
-
-            referrers.push(desc.clone());
-        }
-
-        Ok(referrers)
     }
 
     /// Write a manifest as a blob, and replace the index with a reference to it.
@@ -800,301 +1088,34 @@ impl OciDir {
             .unwrap();
         self.write_index(&index_data)
     }
+}
 
-    fn descriptor_is_tagged(d: &Descriptor, tag: &str) -> bool {
-        d.annotations()
-            .as_ref()
-            .and_then(|annos| annos.get(OCI_TAG_ANNOTATION))
-            .filter(|tagval| tagval.as_str() == tag)
-            .is_some()
-    }
+impl OciRead for OciDir {
+    type BlobReader = File;
 
-    /// Find the manifest with the provided tag
-    pub fn find_manifest_with_tag(&self, tag: &str) -> Result<Option<oci_image::ImageManifest>> {
-        let desc = self.find_manifest_descriptor_with_tag(tag)?;
-        desc.map(|img| self.read_json_blob(&img)).transpose()
-    }
-
-    /// Find the manifest descriptor with the provided tag
-    pub fn find_manifest_descriptor_with_tag(
-        &self,
-        tag: &str,
-    ) -> Result<Option<oci_image::Descriptor>> {
-        let idx = self.read_index()?;
-        Ok(idx
-            .manifests()
-            .iter()
-            .find(|desc| Self::descriptor_is_tagged(desc, tag))
-            .cloned())
-    }
-
-    /// Open an image manifest for the current platform.
-    ///
-    /// This resolves the appropriate manifest from the index for the native
-    /// platform (OS and architecture). If `tag` is provided, only manifests
-    /// with that tag annotation are considered.
-    ///
-    /// If the index contains an image index (manifest list), it is "peeled"
-    /// to get the underlying manifests. Nested image indices are not supported.
-    ///
-    /// Returns a [`ResolvedManifest`] containing the manifest, its digest,
-    /// and optionally the image index it was resolved from with its digest.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The index cannot be read
-    /// - The index is empty
-    /// - A tag is specified but not found
-    /// - No manifest matches the native platform
-    /// - A nested image index is encountered
-    pub fn open_image_this_platform(&self, tag: Option<&str>) -> Result<ResolvedManifest> {
-        let index = self.read_index()?;
-        let manifests = index.manifests();
-
-        // Filter by tag if specified, returning early on empty results
-        let candidates: Vec<_> = if let Some(tag) = tag {
-            let tagged: Vec<_> = manifests
-                .iter()
-                .filter(|d| Self::descriptor_is_tagged(d, tag))
-                .collect();
-            if tagged.is_empty() {
-                return Err(Error::TagNotFound { tag: tag.into() });
-            }
-            tagged
-        } else {
-            if manifests.is_empty() {
-                return Err(Error::EmptyImageIndex);
-            }
-            manifests.iter().collect()
-        };
-
-        // Get the native platform
-        let native_platform = Platform::default();
-
-        // Collect all found candidate descriptors for error reporting
-        let mut found_candidates: Vec<Descriptor> = Vec::new();
-
-        for desc in candidates {
-            match desc.media_type() {
-                MediaType::ImageManifest => {
-                    if let Some(manifest) =
-                        self.resolve_descriptor_for_platform(desc, &native_platform)?
-                    {
-                        return Ok(ResolvedManifest {
-                            manifest,
-                            manifest_descriptor: desc.clone(),
-                            source_index: None,
-                        });
-                    }
-                    found_candidates.push(desc.clone());
-                }
-                MediaType::ImageIndex => {
-                    // Peel the manifest list
-                    let nested: ImageIndex = self.read_json_blob(desc)?;
-                    let index_descriptor = desc.clone();
-
-                    if let Some(resolved) = self.resolve_manifest_list(
-                        nested,
-                        index_descriptor,
-                        &native_platform,
-                        &mut found_candidates,
-                    )? {
-                        return Ok(resolved);
-                    }
-                }
-                other => {
-                    return Err(Error::UnexpectedMediaType {
-                        media_type: other.clone(),
-                    });
-                }
-            }
-        }
-
-        // No match found
-        Err(Error::NoMatchingPlatform {
-            os: native_platform.os().to_string().into(),
-            architecture: native_platform.architecture().to_string().into(),
-            available: Self::format_available_platforms(found_candidates.iter()),
-        })
-    }
-
-    /// Resolve a manifest from an image index (manifest list) for a given platform.
-    ///
-    /// Iterates the manifests within the index, returning the first one that
-    /// matches `native_platform`. Non-matching descriptors are appended to
-    /// `found_candidates` so callers can include them in error messages.
-    ///
-    /// Returns `Ok(None)` if no manifest in this index matched.
-    fn resolve_manifest_list(
-        &self,
-        index: ImageIndex,
-        index_descriptor: Descriptor,
-        native_platform: &Platform,
-        found_candidates: &mut Vec<Descriptor>,
-    ) -> Result<Option<ResolvedManifest>> {
-        for desc in index.manifests() {
-            match desc.media_type() {
-                MediaType::ImageIndex => {
-                    return Err(Error::NestedImageIndex);
-                }
-                MediaType::ImageManifest => {
-                    if let Some(manifest) =
-                        self.resolve_descriptor_for_platform(desc, native_platform)?
-                    {
-                        return Ok(Some(ResolvedManifest {
-                            manifest,
-                            manifest_descriptor: desc.clone(),
-                            source_index: Some((index, index_descriptor)),
-                        }));
-                    }
-                    found_candidates.push(desc.clone());
-                }
-                other => {
-                    return Err(Error::UnexpectedMediaType {
-                        media_type: other.clone(),
-                    });
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Format the available platforms from a list of descriptors for error messages.
-    /// Limits output to 10 platforms to prevent excessive memory usage.
-    fn format_available_platforms<'a>(manifests: impl Iterator<Item = &'a Descriptor>) -> Box<str> {
-        const MAX_PLATFORMS_IN_ERROR: usize = 10;
-
-        let platforms: Vec<_> = manifests
-            .filter_map(|d| {
-                d.platform()
-                    .as_ref()
-                    .map(|p| format!("{}/{}", p.os(), p.architecture()))
-            })
-            .take(MAX_PLATFORMS_IN_ERROR + 1) // Take one extra to detect truncation
-            .collect();
-
-        if platforms.is_empty() {
-            return "(no platform info)".into();
-        }
-
-        if platforms.len() > MAX_PLATFORMS_IN_ERROR {
-            let truncated: Vec<_> = platforms.into_iter().take(MAX_PLATFORMS_IN_ERROR).collect();
-            format!("{}, ...", truncated.join(", ")).into()
-        } else {
-            platforms.join(", ").into()
-        }
-    }
-
-    /// Check if a platform is compatible with the native platform.
-    ///
-    /// Platform has additional optional fields (variant, os_version,
-    /// os_features, features) which are primarily used for Windows images.
-    /// We only compare architecture and OS for compatibility.
-    fn platform_compatible(platform: &Platform, native: &Platform) -> bool {
-        platform.architecture() == native.architecture() && platform.os() == native.os()
-    }
-
-    /// Resolve a manifest descriptor for the given platform, reading the config
-    /// blob when the descriptor has no explicit `platform` annotation.
-    ///
-    /// Returns `Ok(Some(manifest))` when `desc` is compatible with `native`,
-    /// `Ok(None)` when it is not, and `Err(_)` on I/O or parse errors.
-    fn resolve_descriptor_for_platform(
-        &self,
-        desc: &Descriptor,
-        native: &Platform,
-    ) -> Result<Option<ImageManifest>> {
-        // Fast path: explicit platform annotation — no blob I/O needed.
-        if let Some(platform) = desc.platform().as_ref() {
-            if Self::platform_compatible(platform, native) {
-                return Ok(Some(self.read_json_blob::<ImageManifest>(desc)?));
-            }
-            return Ok(None);
-        }
-
-        // If there's no annotation then read the manifest and config.
-        let manifest = self.read_json_blob::<ImageManifest>(desc)?;
-
-        // Only image manifests (not OCI artifact manifests) carry a platform in
-        // their config blob. Skip the read entirely for anything else.
-        if manifest.config().media_type() != &MediaType::ImageConfig {
-            return Ok(None);
-        }
-
-        let config: ImageConfiguration = self.read_json_blob(manifest.config())?;
-        if config.architecture() == native.architecture() && config.os() == native.os() {
-            Ok(Some(manifest))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Verify a blob's SHA-256 digest matches its descriptor.
-    fn verify_blob_digest(&self, desc: &Descriptor) -> Result<()> {
-        let expected = sha256_of_descriptor(desc)?;
-        let mut f = self.read_blob(desc)?;
-        let mut hasher = Hasher::new(MessageDigest::sha256())?;
-        std::io::copy(&mut f, &mut hasher)?;
-        let found = hex::encode(hasher.finish()?);
+    fn read_blob(&self, desc: &Descriptor) -> Result<File> {
+        let path = Self::parse_descriptor_to_path(desc)?;
+        let f = self.blobs_dir.open(path).map(|f| f.into_std())?;
+        let expected: u64 = desc.size();
+        let found = f.metadata()?.len();
         if expected != found {
-            return Err(Error::DigestMismatch {
-                expected: expected.into(),
-                found: found.into(),
-            });
+            return Err(Error::SizeMismatch { expected, found });
         }
-        Ok(())
+        Ok(f)
     }
 
-    /// Verify a single manifest and all of its referenced objects.
-    /// Skips already validated blobs referenced by digest in `validated`,
-    /// and updates that set with ones we did validate.
-    fn fsck_one_manifest(
-        &self,
-        manifest: &ImageManifest,
-        validated: &mut HashSet<Box<str>>,
-    ) -> Result<()> {
-        let config_digest = sha256_of_descriptor(manifest.config())?;
-        if !validated.contains(config_digest) {
-            // Always verify the config blob digest, regardless of media type.
-            self.verify_blob_digest(manifest.config())?;
-            // Additionally validate the content structure for known types.
-            match manifest.config().media_type() {
-                MediaType::ImageConfig => {
-                    let _: ImageConfiguration = self.read_json_blob(manifest.config())?;
-                }
-                MediaType::EmptyJSON => {
-                    let _: EmptyDescriptor = self.read_json_blob(manifest.config())?;
-                }
-                // Per the OCI image spec, implementations MUST NOT error on
-                // encountering an unknown config mediaType.
-                _ => {}
-            }
-            validated.insert(config_digest.into());
-        }
-        for layer in manifest.layers() {
-            let expected = sha256_of_descriptor(layer)?;
-            if validated.contains(expected) {
-                continue;
-            }
-            self.verify_blob_digest(layer)?;
-            validated.insert(expected.into());
-        }
-        Ok(())
+    fn read_index(&self) -> Result<ImageIndex> {
+        let r = if let Some(index) = self.dir.open_optional("index.json")?.map(BufReader::new) {
+            oci_image::ImageIndex::from_reader(index)?
+        } else {
+            return Err(Error::MissingImageIndex);
+        };
+        Ok(r)
     }
 
-    /// Verify consistency of the index, its manifests, the config and blobs (all the latter)
-    /// by verifying their descriptor.
-    pub fn fsck(&self) -> Result<u64> {
-        let index = self.read_index()?;
-        let mut validated_blobs = HashSet::new();
-        for manifest_descriptor in index.manifests() {
-            let expected_sha256 = sha256_of_descriptor(manifest_descriptor)?;
-            let manifest: ImageManifest = self.read_json_blob(manifest_descriptor)?;
-            validated_blobs.insert(expected_sha256.into());
-            self.fsck_one_manifest(&manifest, &mut validated_blobs)?;
-        }
-        Ok(validated_blobs.len().try_into().unwrap())
+    fn has_blob(&self, desc: &Descriptor) -> Result<bool> {
+        let path = OciDir::parse_descriptor_to_path(desc)?;
+        self.blobs_dir.try_exists(path).map_err(Into::into)
     }
 }
 
