@@ -25,8 +25,15 @@ use std::fmt::Debug;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, prelude::*};
 use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+#[cfg(not(any(unix, windows)))]
+compile_error!("ocidir requires pread support (unix read_at or windows seek_read)");
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export our dependencies that are used as part of the public API.
@@ -1116,6 +1123,152 @@ impl OciRead for OciDir {
     fn has_blob(&self, desc: &Descriptor) -> Result<bool> {
         let path = OciDir::parse_descriptor_to_path(desc)?;
         self.blobs_dir.try_exists(path).map_err(Into::into)
+    }
+}
+
+/// A reader for a region of a file, using pread for concurrent access.
+#[derive(Debug)]
+pub struct ArchiveReader {
+    file: Arc<File>,
+    start: u64,
+    offset: u64,
+    size: u64,
+}
+
+impl Read for ArchiveReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = (self.size - self.offset) as usize;
+        let to_read = buf.len().min(remaining);
+        if to_read == 0 {
+            return Ok(0);
+        }
+        #[cfg(unix)]
+        let n = self
+            .file
+            .read_at(&mut buf[..to_read], self.start + self.offset)?;
+        #[cfg(windows)]
+        let n = self
+            .file
+            .seek_read(&mut buf[..to_read], self.start + self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for ArchiveReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            std::io::SeekFrom::Start(n) => n.min(self.size),
+            std::io::SeekFrom::End(n) => {
+                if n >= 0 {
+                    self.size
+                } else {
+                    self.size.saturating_sub((-n) as u64)
+                }
+            }
+            std::io::SeekFrom::Current(n) => {
+                if n >= 0 {
+                    self.offset.saturating_add(n as u64).min(self.size)
+                } else {
+                    self.offset.saturating_sub((-n) as u64)
+                }
+            }
+        };
+        self.offset = new_pos;
+        Ok(new_pos)
+    }
+}
+
+/// A read-only OCI image stored as a tar archive.
+///
+/// This type provides read access to OCI images packaged as tar files
+/// (the OCI archive format). It scans the tar entries on open and uses
+/// pread-based access for concurrent blob reads.
+#[derive(Debug)]
+pub struct OciArchive {
+    file: Arc<File>,
+    /// Map from tar entry path (e.g. "blobs/sha256/abcd...") to (offset, size).
+    entries: HashMap<PathBuf, (u64, u64)>,
+}
+
+impl OciArchive {
+    /// Open an OCI archive from a filesystem path.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        Self::from_file(file)
+    }
+
+    /// Open an OCI archive from an already-opened file.
+    pub fn from_file(file: File) -> Result<Self> {
+        let mut archive = tar::Archive::new(&file);
+        let mut entries = HashMap::new();
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let path: PathBuf = entry
+                .path()?
+                .components()
+                .filter(|c| *c != std::path::Component::CurDir)
+                .collect();
+            let offset = entry.raw_file_position();
+            let size = entry.size();
+            entries.insert(path, (offset, size));
+        }
+        Ok(Self {
+            file: Arc::new(file),
+            entries,
+        })
+    }
+
+    fn open_entry(&self, path: &Path) -> Result<ArchiveReader> {
+        let &(offset, size) = self.entries.get(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("not found in archive: {}", path.display()),
+            )
+        })?;
+        Ok(ArchiveReader {
+            file: Arc::clone(&self.file),
+            start: offset,
+            offset: 0,
+            size,
+        })
+    }
+}
+
+impl OciRead for OciArchive {
+    type BlobReader = ArchiveReader;
+
+    fn read_blob(&self, desc: &Descriptor) -> Result<ArchiveReader> {
+        let sha256 = sha256_of_descriptor(desc)?;
+        let path = Path::new(BLOBDIR).join(sha256);
+        let reader = self.open_entry(&path)?;
+        let expected = desc.size();
+        if expected != reader.size {
+            return Err(Error::SizeMismatch {
+                expected,
+                found: reader.size,
+            });
+        }
+        Ok(reader)
+    }
+
+    fn read_index(&self) -> Result<ImageIndex> {
+        let reader = self
+            .open_entry(Path::new("index.json"))
+            .map_err(|e| match e {
+                Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    Error::MissingImageIndex
+                }
+                other => other,
+            })?;
+        let index = oci_image::ImageIndex::from_reader(BufReader::new(reader))?;
+        Ok(index)
+    }
+
+    fn has_blob(&self, desc: &Descriptor) -> Result<bool> {
+        let digest = sha256_of_descriptor(desc)?;
+        let path = Path::new(BLOBDIR).join(digest);
+        Ok(self.entries.contains_key(&path))
     }
 }
 
@@ -2351,6 +2504,77 @@ mod tests {
         let validated = w.fsck()?;
         // base manifest + base config + artifact manifest + empty config + content blob = 5
         assert_eq!(validated, 5, "fsck should validate exactly 5 blobs");
+
+        Ok(())
+    }
+
+    fn append_cap_file(
+        tar: &mut tar::Builder<File>,
+        path: &str,
+        f: cap_std::fs::File,
+    ) -> Result<()> {
+        let f = f.into_std();
+        let len = f.metadata()?.len();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(len);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, &f)?;
+        Ok(())
+    }
+
+    fn ocidir_to_tar_file(w: &OciDir) -> Result<File> {
+        let archive_path = std::env::temp_dir().join("test_oci_archive.tar");
+        let archive_file = std::fs::File::create(&archive_path)?;
+        let mut tar_builder = tar::Builder::new(archive_file);
+
+        append_cap_file(&mut tar_builder, "oci-layout", w.dir().open("oci-layout")?)?;
+        append_cap_file(&mut tar_builder, "index.json", w.dir().open("index.json")?)?;
+
+        for entry in w.blobs_dir().entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let path = format!("{BLOBDIR}/{}", name.to_string_lossy());
+            append_cap_file(&mut tar_builder, &path, w.blobs_dir().open(name)?)?;
+        }
+
+        tar_builder.finish()?;
+        let f = std::fs::File::open(&archive_path)?;
+        std::fs::remove_file(&archive_path)?;
+        Ok(f)
+    }
+
+    #[test]
+    fn test_open_archive() -> Result<()> {
+        let (_td, w) = new_ocidir()?;
+
+        let root_layer = create_test_layer(&w, b"pretend this is a tarball")?;
+        let mut manifest = w.new_empty_manifest()?.build()?;
+        let mut config = new_empty_config();
+        w.push_layer(&mut manifest, &mut config, root_layer, "root", None);
+        w.insert_manifest_and_config(
+            manifest,
+            config,
+            Some("latest"),
+            oci_image::Platform::default(),
+        )?;
+
+        let expected_fsck = w.fsck()?;
+
+        let tar_file = ocidir_to_tar_file(&w)?;
+        let archive = OciArchive::from_file(tar_file)?;
+
+        let index = archive.read_index()?;
+        assert_eq!(index.manifests().len(), 1);
+
+        let resolved = archive.open_image_this_platform(Some("latest"))?;
+        assert_eq!(resolved.manifest.layers().len(), 1);
+
+        assert_eq!(archive.fsck()?, expected_fsck);
+
+        let found = archive.find_manifest_with_tag("latest")?;
+        assert!(found.is_some());
+        assert!(archive.find_manifest_with_tag("noent")?.is_none());
 
         Ok(())
     }
