@@ -26,6 +26,7 @@ To access an existing OCI directory:
 
 ```rust,no_run
 # use ocidir::cap_std;
+# use ocidir::prelude::*;
 # use anyhow::{anyhow, Result};
 # fn main() -> anyhow::Result<()> {
 let d = cap_std::fs::Dir::open_ambient_dir("/path/to/ocidir", cap_std::ambient_authority())?;
