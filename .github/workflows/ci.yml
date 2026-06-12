@@ -4,12 +4,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
 permissions:
   contents: read
 
 # don't waste job slots on superseded code
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -47,3 +48,20 @@ jobs:
         # GitHub runner IPs. Don't let transient registry failures block CI.
         continue-on-error: true
         run: just selftest
+
+  required-checks:
+    name: Required Checks
+    if: always()
+    needs: [semver-checks, build-test-lint]
+    runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJson(needs) }}
+    steps:
+      - name: Check all jobs
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped."
