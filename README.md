@@ -1,6 +1,7 @@
 # ocidir
 
 [![Crates.io][crates-badge]][crates-url]
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbootc-dev%2Focidir-rs.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbootc-dev%2Focidir-rs?ref=badge_shield)
 
 [crates-badge]: https://img.shields.io/crates/v/ocidir.svg
 [crates-url]: https://crates.io/crates/ocidir
@@ -38,3 +39,7 @@ println!("{:?}", d.read_index()?);
 
 [cap-std]: https://docs.rs/cap-std/
 [OCI images]: https://github.com/opencontainers/image-spec
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbootc-dev%2Focidir-rs.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbootc-dev%2Focidir-rs?ref=badge_large)
