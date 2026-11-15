@@ -356,6 +356,18 @@ pub trait OciRead {
     /// - No manifest matches the native platform
     /// - A nested image index is encountered
     fn open_image_this_platform(&self, tag: Option<&str>) -> Result<ResolvedManifest> {
+        self.open_image_for_platform(tag, &Platform::default())
+    }
+
+    /// Open an image for `platform` rather than the running one.
+    ///
+    /// Behaves as [`Self::open_image_this_platform`], matching manifests
+    /// against the given platform instead of the host's.
+    fn open_image_for_platform(
+        &self,
+        tag: Option<&str>,
+        platform: &Platform,
+    ) -> Result<ResolvedManifest> {
         let index = self.read_index()?;
         let manifests = index.manifests();
 
@@ -376,18 +388,13 @@ pub trait OciRead {
             manifests.iter().collect()
         };
 
-        // Get the native platform
-        let native_platform = Platform::default();
-
         // Collect all found candidate descriptors for error reporting
         let mut found_candidates: Vec<Descriptor> = Vec::new();
 
         for desc in candidates {
             match desc.media_type() {
                 MediaType::ImageManifest => {
-                    if let Some(manifest) =
-                        self.resolve_descriptor_for_platform(desc, &native_platform)?
-                    {
+                    if let Some(manifest) = self.resolve_descriptor_for_platform(desc, platform)? {
                         return Ok(ResolvedManifest {
                             manifest,
                             manifest_descriptor: desc.clone(),
@@ -404,7 +411,7 @@ pub trait OciRead {
                     if let Some(resolved) = self.resolve_manifest_list(
                         nested,
                         index_descriptor,
-                        &native_platform,
+                        platform,
                         &mut found_candidates,
                     )? {
                         return Ok(resolved);
@@ -420,8 +427,8 @@ pub trait OciRead {
 
         // No match found
         Err(Error::NoMatchingPlatform {
-            os: native_platform.os().to_string().into(),
-            architecture: native_platform.architecture().to_string().into(),
+            os: platform.os().to_string().into(),
+            architecture: platform.architecture().to_string().into(),
             available: format_available_platforms(found_candidates.iter()),
         })
     }
@@ -2065,6 +2072,117 @@ mod tests {
                         "case '{name}': expected TagNotFound, got {result:?}"
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_image_for_platform() -> Result<()> {
+        fn linux(arch: Arch) -> oci_image::Platform {
+            oci_image::PlatformBuilder::default()
+                .architecture(arch)
+                .os(Os::Linux)
+                .build()
+                .unwrap()
+        }
+
+        // An index annotated for amd64 and arm64, as a multi-arch image would be.
+        fn multi_arch(w: &OciDir) -> Result<()> {
+            let amd64 = build_foreign_platform_desc(w, Arch::Amd64, Os::Linux)?;
+            let arm64 = build_foreign_platform_desc(w, Arch::ARM64, Os::Linux)?;
+            let index = oci_image::ImageIndexBuilder::default()
+                .schema_version(oci_image::SCHEMA_VERSION)
+                .manifests(vec![amd64, arm64])
+                .build()?;
+            w.write_index(&index)
+        }
+
+        // A single arm64 manifest whose descriptor has no platform annotation.
+        fn unannotated_arm64(w: &OciDir) -> Result<()> {
+            let config = oci_image::ImageConfigurationBuilder::default()
+                .architecture(Arch::ARM64)
+                .os(Os::Linux)
+                .build()
+                .unwrap();
+            let config_desc = w.write_config(config)?;
+            let mut manifest = w.new_empty_manifest()?.build()?;
+            manifest.set_config(config_desc);
+            let manifest_desc = w
+                .write_json_blob(&manifest, MediaType::ImageManifest)?
+                .build()?;
+            let index = oci_image::ImageIndexBuilder::default()
+                .schema_version(oci_image::SCHEMA_VERSION)
+                .manifests(vec![manifest_desc])
+                .build()?;
+            w.write_index(&index)
+        }
+
+        struct Case {
+            name: &'static str,
+            setup: fn(&OciDir) -> Result<()>,
+            platform: oci_image::Platform,
+            /// The annotated architecture of the selected descriptor, or None
+            /// when the descriptor carries no platform; Err means no match.
+            expected: std::result::Result<Option<Arch>, ()>,
+        }
+
+        let cases = [
+            Case {
+                name: "selects arm64 from a multi-arch index",
+                setup: multi_arch,
+                platform: linux(Arch::ARM64),
+                expected: Ok(Some(Arch::ARM64)),
+            },
+            Case {
+                name: "selects amd64 from a multi-arch index",
+                setup: multi_arch,
+                platform: linux(Arch::Amd64),
+                expected: Ok(Some(Arch::Amd64)),
+            },
+            Case {
+                name: "no manifest for the requested platform",
+                setup: multi_arch,
+                platform: linux(Arch::s390x),
+                expected: Err(()),
+            },
+            Case {
+                name: "matches an unannotated descriptor by its config",
+                setup: unannotated_arm64,
+                platform: linux(Arch::ARM64),
+                expected: Ok(None),
+            },
+            Case {
+                name: "rejects an unannotated descriptor with another config",
+                setup: unannotated_arm64,
+                platform: linux(Arch::Amd64),
+                expected: Err(()),
+            },
+        ];
+
+        for case in &cases {
+            let (_td, w) = new_ocidir()?;
+            (case.setup)(&w)?;
+            let result = w.open_image_for_platform(None, &case.platform);
+
+            let name = case.name;
+            match (&case.expected, result) {
+                (Ok(arch), Ok(resolved)) => assert_eq!(
+                    resolved
+                        .manifest_descriptor
+                        .platform()
+                        .as_ref()
+                        .map(|p| p.architecture().clone()),
+                    *arch,
+                    "case '{name}': selected descriptor"
+                ),
+                (Err(()), Err(Error::NoMatchingPlatform { architecture, .. })) => assert_eq!(
+                    &*architecture,
+                    case.platform.architecture().to_string(),
+                    "case '{name}': error names the requested architecture"
+                ),
+                (_, other) => panic!("case '{name}': unexpected result {other:?}"),
             }
         }
 
